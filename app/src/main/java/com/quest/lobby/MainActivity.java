@@ -101,6 +101,15 @@ public class MainActivity extends Activity {
 
         FileLogger.start(this);
 
+        // Start foreground service that runs the kiosk watchdog independently of Activity lifecycle.
+        // Bypasses Android's background Handler throttling, keeping Meta-menu detection snappy.
+        Intent kioskIntent = new Intent(this, KioskService.class);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            startForegroundService(kioskIntent);
+        } else {
+            startService(kioskIntent);
+        }
+
         // Restore Content state across Activity recreation
         // (system may kill+recreate Lobby while Content is running)
         SharedPreferences savedPrefs = getSharedPreferences(PREFS, MODE_PRIVATE);
@@ -194,10 +203,8 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         isRunning = false;
-        // ALWAYS start kiosk watchdog. The watchdog itself decides:
-        //  - If Content in foreground → leave it alone
-        //  - If neither Content nor Lobby in foreground → pull Lobby back
-        startKioskWatchdog();
+        // Watchdog is now handled by KioskService (foreground service) — see onCreate.
+        // No need to start Activity-based watchdog here.
     }
 
     @Override
@@ -693,7 +700,12 @@ public class MainActivity extends Activity {
                 PackageManager pm = getPackageManager();
                 Intent intent = pm.getLaunchIntentForPackage(currentContentPackage);
                 if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    // FLAG_ACTIVITY_REORDER_TO_FRONT: if Content's task exists, just bring it
+                    //   to top (no recreate, faster, no flash)
+                    // FLAG_ACTIVITY_SINGLE_TOP: don't create new instance if it's already on top
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                            | Intent.FLAG_ACTIVITY_SINGLE_TOP);
                     startActivity(intent);
                     mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
                     return;
@@ -760,13 +772,21 @@ public class MainActivity extends Activity {
     }
 
     private String getForegroundPackage() {
-        if (!hasUsageStatsPermission()) {
-            Log.w(TAG, "PACKAGE_USAGE_STATS permission not granted — cannot detect foreground app");
-            return null;
-        }
-        UsageStatsManager usm = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+        return queryForegroundPackage(this);
+    }
+
+    /** Static so KioskService can share the same logic. */
+    public static String queryForegroundPackage(Context ctx) {
+        AppOpsManager appOps = (AppOpsManager) ctx.getSystemService(Context.APP_OPS_SERVICE);
+        int mode = appOps.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS,
+                Process.myUid(),
+                ctx.getPackageName());
+        if (mode != AppOpsManager.MODE_ALLOWED) return null;
+
+        UsageStatsManager usm = (UsageStatsManager) ctx.getSystemService(Context.USAGE_STATS_SERVICE);
         long end = System.currentTimeMillis();
-        long begin = end - 1000L * 5; // last 5 seconds (was 30s — too wide, slow to query)
+        long begin = end - 1000L * 5;
 
         UsageEvents events = usm.queryEvents(begin, end);
         UsageEvents.Event ev = new UsageEvents.Event();
