@@ -38,6 +38,18 @@ public class KioskService extends Service {
     private Handler handler;
     private volatile boolean running = false;
 
+    // Cache pidof result for this long — running it every 100ms eats CPU and may
+    // slow down Content's rendering, causing the "Meta menu dismiss slowly covers Content" issue.
+    private static final long PID_CACHE_MS = 2000;
+    private long lastPidCheckTime = 0;
+    private boolean lastPidAlive = false;
+
+    // Track previous foreground — only intervene when state ACTUALLY changes,
+    // not on every 100ms tick. Avoids redundant startActivity calls during play.
+    private String lastFg = null;
+    private long lastInterventionMs = 0;
+    private static final long MIN_INTERVENTION_INTERVAL_MS = 500;
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -82,19 +94,27 @@ public class KioskService extends Service {
     private void doCheck() {
         SharedPreferences prefs = getSharedPreferences("lobby_state", MODE_PRIVATE);
         boolean shouldRun = prefs.getBoolean("content_should_run", false);
-        if (!shouldRun) return; // No Content launched, nothing to monitor
+        if (!shouldRun) return;
 
         long launchedAt = prefs.getLong("content_launched_at", 0);
-        if (System.currentTimeMillis() - launchedAt < LAUNCH_GRACE_MS) return;
+        long now = System.currentTimeMillis();
+        if (now - launchedAt < LAUNCH_GRACE_MS) return;
 
         String contentPkg = prefs.getString("content_package", "com.moondream.HellVR");
         String fg = MainActivity.queryForegroundPackage(this);
-        if (fg == null) return;
-        if (fg.equals(contentPkg)) return;
-        if (fg.equals(getPackageName())) return;
+        if (fg == null) { lastFg = null; return; }
+        if (fg.equals(contentPkg)) { lastFg = fg; return; }
+        if (fg.equals(getPackageName())) { lastFg = fg; return; }
 
-        // Foreground is something else (Meta menu, Quest home, etc.)
-        if (isAlive(contentPkg)) {
+        // Foreground is something else (Meta menu / Quest home / etc.)
+        // Only intervene if state CHANGED or enough time has passed since last intervention.
+        // Avoid spamming startActivity calls that interfere with Quest's natural menu dismiss.
+        boolean stateChanged = !fg.equals(lastFg);
+        boolean cooldownPassed = now - lastInterventionMs > MIN_INTERVENTION_INTERVAL_MS;
+        if (!stateChanged && !cooldownPassed) return;
+        lastFg = fg;
+
+        if (isAliveCached(contentPkg)) {
             Log.d(TAG, "KioskService: fg=" + fg + ", Content alive — bringing back");
             try {
                 PackageManager pm = getPackageManager();
@@ -104,33 +124,40 @@ public class KioskService extends Service {
                             | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
                             | Intent.FLAG_ACTIVITY_SINGLE_TOP);
                     startActivity(intent);
+                    lastInterventionMs = now;
                 }
             } catch (Exception e) {
                 Log.e(TAG, "KioskService start Content failed: " + e.getMessage());
             }
         } else {
-            // Content dead — bring Lobby back to handle reconnect logic
             Log.d(TAG, "KioskService: fg=" + fg + ", Content DEAD — bringing Lobby back");
             try {
                 Intent intent = new Intent(this, MainActivity.class);
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                 startActivity(intent);
+                lastInterventionMs = now;
             } catch (Exception e) {
                 Log.e(TAG, "KioskService start Lobby failed: " + e.getMessage());
             }
         }
     }
 
-    private boolean isAlive(String pkg) {
+    private boolean isAliveCached(String pkg) {
+        long now = System.currentTimeMillis();
+        if (now - lastPidCheckTime < PID_CACHE_MS) {
+            return lastPidAlive;
+        }
+        lastPidCheckTime = now;
         try {
             java.lang.Process proc = Runtime.getRuntime().exec(new String[]{"sh", "-c", "pidof " + pkg});
             proc.waitFor();
             BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
             String pid = reader.readLine();
-            return pid != null && !pid.trim().isEmpty();
+            lastPidAlive = pid != null && !pid.trim().isEmpty();
         } catch (Exception e) {
-            return false;
+            lastPidAlive = false;
         }
+        return lastPidAlive;
     }
 
     private void createNotificationChannel() {
