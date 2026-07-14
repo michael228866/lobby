@@ -35,8 +35,16 @@ public class KioskService extends Service {
     private static final long CHECK_INTERVAL_MS = 100;
     private static final long LAUNCH_GRACE_MS = 8000;
 
+    // Lock Task is unavailable on this Quest (Meta account blocks device owner), so we fall
+    // back to the startActivity pullback — but push back only ONCE per intrusion (see doCheck)
+    // so the user sees a single flash, not the continuous "畫面一直閃" fighting.
+    private static final boolean FOREGROUND_PULLBACK_ENABLED = true;
+
     private Handler handler;
     private volatile boolean running = false;
+
+    // Diagnostic: remember the last foreground package so we log only on change (not every 100ms).
+    private String lastLoggedFg = null;
 
     // Cache pidof result for this long — running it every 100ms eats CPU and may
     // slow down Content's rendering, causing the "Meta menu dismiss slowly covers Content" issue.
@@ -44,11 +52,14 @@ public class KioskService extends Service {
     private long lastPidCheckTime = 0;
     private boolean lastPidAlive = false;
 
-    // Track previous foreground — only intervene when state ACTUALLY changes,
-    // not on every 100ms tick. Avoids redundant startActivity calls during play.
-    private String lastFg = null;
+    // "Flash once per menu-open" state: we push the target back only when we see a foreground
+    // event NEWER than the one we last handled. Each Meta-menu open is a fresh event with a
+    // new timestamp, so every open flashes exactly once; while the same menu stays open the
+    // timestamp doesn't change, so we don't keep fighting (no "一直閃"). This works even though
+    // REORDER_TO_FRONT produces no "Lobby returned" event to reset on.
+    private long lastHandledFgTime = 0;
     private long lastInterventionMs = 0;
-    private static final long MIN_INTERVENTION_INTERVAL_MS = 500;
+    private static final long MIN_INTERVENTION_INTERVAL_MS = 500;  // safety cap between pushes
 
     @Override
     public void onCreate() {
@@ -92,53 +103,65 @@ public class KioskService extends Service {
     }
 
     private void doCheck() {
+        if (!FOREGROUND_PULLBACK_ENABLED) return;  // TEMP: Lock Task handles kiosk, no fighting
+
         SharedPreferences prefs = getSharedPreferences("lobby_state", MODE_PRIVATE);
         boolean shouldRun = prefs.getBoolean("content_should_run", false);
-        if (!shouldRun) return;
-
-        long launchedAt = prefs.getLong("content_launched_at", 0);
-        long now = System.currentTimeMillis();
-        if (now - launchedAt < LAUNCH_GRACE_MS) return;
-
         String contentPkg = prefs.getString("content_package", "com.moondream.HellVR");
-        String fg = MainActivity.queryForegroundPackage(this);
-        if (fg == null) { lastFg = null; return; }
-        if (fg.equals(contentPkg)) { lastFg = fg; return; }
-        if (fg.equals(getPackageName())) { lastFg = fg; return; }
 
-        // Foreground is something else (Meta menu / Quest home / etc.)
-        // Only intervene if state CHANGED or enough time has passed since last intervention.
-        // Avoid spamming startActivity calls that interfere with Quest's natural menu dismiss.
-        boolean stateChanged = !fg.equals(lastFg);
-        boolean cooldownPassed = now - lastInterventionMs > MIN_INTERVENTION_INTERVAL_MS;
-        if (!stateChanged && !cooldownPassed) return;
-        lastFg = fg;
+        // While Content is legitimately starting up, don't fight it.
+        if (shouldRun) {
+            long launchedAt = prefs.getLong("content_launched_at", 0);
+            if (System.currentTimeMillis() - launchedAt < LAUNCH_GRACE_MS) return;
+        }
 
-        if (isAliveCached(contentPkg)) {
-            Log.d(TAG, "KioskService: fg=" + fg + ", Content alive — bringing back");
-            try {
-                PackageManager pm = getPackageManager();
-                Intent intent = pm.getLaunchIntentForPackage(contentPkg);
-                if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                            | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                    startActivity(intent);
-                    lastInterventionMs = now;
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "KioskService start Content failed: " + e.getMessage());
+        // Decide who SHOULD own the foreground right now:
+        //  - Content, if it was launched and its process is still alive
+        //  - otherwise the Lobby itself — it is the kiosk home and must stay in front
+        boolean contentShouldOwn = shouldRun && isAliveCached(contentPkg);
+        String target = contentShouldOwn ? contentPkg : getPackageName();
+
+        MainActivity.Foreground fgEvent = MainActivity.queryForeground(this);
+        String fg = (fgEvent == null) ? null : fgEvent.pkg;
+
+        // Foreground is normal (target in front, or null = steady/no recent event) — nothing
+        // to do. Do NOT reset lastHandledFgTime here: a later, newer event is what re-arms us.
+        if (fg == null || fg.equals(target)) {
+            lastLoggedFg = fg;  // may be null
+            return;
+        }
+
+        // A different app grabbed the foreground (Meta menu / Quest home / other).
+        if (!fg.equals(lastLoggedFg)) {
+            Log.d(TAG, "foreground -> " + fg + " @" + fgEvent.time + "  (target=" + target + ")");
+            lastLoggedFg = fg;
+        }
+
+        // Push the target back once per NEW foreground event. Each Meta-menu open produces a
+        // newer timestamp, so every open flashes exactly once; while the same menu stays open
+        // the timestamp is unchanged, so we don't keep fighting (no continuous flashing).
+        if (fgEvent.time <= lastHandledFgTime) return;
+        long now = System.currentTimeMillis();
+        if (now - lastInterventionMs < MIN_INTERVENTION_INTERVAL_MS) return;  // safety cap
+        lastHandledFgTime = fgEvent.time;
+        lastInterventionMs = now;
+
+        try {
+            Intent intent;
+            if (contentShouldOwn) {
+                Log.d(TAG, "bringing Content back (fg=" + fg + ")");
+                intent = getPackageManager().getLaunchIntentForPackage(contentPkg);
+                if (intent == null) return;
+            } else {
+                Log.d(TAG, "bringing Lobby back (fg=" + fg + ")");
+                intent = new Intent(this, MainActivity.class);
             }
-        } else {
-            Log.d(TAG, "KioskService: fg=" + fg + ", Content DEAD — bringing Lobby back");
-            try {
-                Intent intent = new Intent(this, MainActivity.class);
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                startActivity(intent);
-                lastInterventionMs = now;
-            } catch (Exception e) {
-                Log.e(TAG, "KioskService start Lobby failed: " + e.getMessage());
-            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            startActivity(intent);
+        } catch (Exception e) {
+            Log.e(TAG, "KioskService bring-back failed: " + e.getMessage());
         }
     }
 

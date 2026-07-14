@@ -12,6 +12,7 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
+#include <cmath>
 
 #define TAG "LobbyVR"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -49,10 +50,116 @@ static bool gSessionReady = false;
 static std::vector<SwapchainData> gSwapchains;
 static std::vector<XrViewConfigurationView> gConfigViews;
 
-// Scene color: dark blue for Lobby
+// Scene color: dark blue for Lobby (fallback until the panorama texture is uploaded)
 static const float CLEAR_R = 0.05f;
 static const float CLEAR_G = 0.05f;
 static const float CLEAR_B = 0.20f;
+
+// ---- Panorama (equirectangular 360 background) ----
+// CPU pixels handed over from Java (BitmapFactory) via nativeSetPanorama; the render
+// thread uploads them to a GL texture on the first frame after the flag is set.
+static std::vector<uint8_t> gPanoPixels;   // RGBA8, row 0 = top of image
+static int gPanoW = 0;
+static int gPanoH = 0;
+static std::atomic<bool> gPanoDirty{false};
+static GLuint gPanoTex = 0;
+static GLuint gPanoProgram = 0;
+static GLuint gPanoVAO = 0;
+
+static GLuint compileShader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+        LOGE("shader compile failed: %s", log);
+        glDeleteShader(s);
+        return 0;
+    }
+    return s;
+}
+
+static const char* PANO_VS = R"(#version 300 es
+// Fullscreen triangle, no vertex buffer needed.
+out vec2 vUV;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
+                  (gl_VertexID == 2) ? 3.0 : -1.0);
+    vUV = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+)";
+
+static const char* PANO_FS = R"(#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uPano;
+uniform vec4 uFovTan;  // (tanLeft, tanRight, tanDown, tanUp); Left/Down are negative
+uniform vec4 uQuat;    // head orientation quaternion (x, y, z, w)
+
+vec3 rotate(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+void main() {
+    // View-space ray from per-eye fov tangents (view looks down -Z).
+    float x = mix(uFovTan.x, uFovTan.y, vUV.x);
+    float y = mix(uFovTan.z, uFovTan.w, vUV.y);
+    vec3 dir = normalize(rotate(uQuat, normalize(vec3(x, y, -1.0))));
+
+    const float PI = 3.14159265359;
+    // Forward (-Z) maps to the image centre (the portal).
+    float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
+    float v = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) / PI;
+    frag = texture(uPano, vec2(u, v));
+}
+)";
+
+static void initPanoProgram() {
+    if (gPanoProgram != 0) return;
+    GLuint vs = compileShader(GL_VERTEX_SHADER, PANO_VS);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, PANO_FS);
+    if (!vs || !fs) return;
+    gPanoProgram = glCreateProgram();
+    glAttachShader(gPanoProgram, vs);
+    glAttachShader(gPanoProgram, fs);
+    glLinkProgram(gPanoProgram);
+    GLint ok = 0;
+    glGetProgramiv(gPanoProgram, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(gPanoProgram, sizeof(log), nullptr, log);
+        LOGE("pano program link failed: %s", log);
+        glDeleteProgram(gPanoProgram);
+        gPanoProgram = 0;
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glGenVertexArrays(1, &gPanoVAO);
+    LOGI("pano program ready");
+}
+
+static void uploadPanoIfNeeded() {
+    if (!gPanoDirty.load()) return;
+    gPanoDirty = false;
+    if (gPanoPixels.empty() || gPanoW <= 0 || gPanoH <= 0) return;
+    if (gPanoTex == 0) glGenTextures(1, &gPanoTex);
+    glBindTexture(GL_TEXTURE_2D, gPanoTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);        // seamless horizontal wrap
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE); // clamp poles
+    // Upload as sRGB so sampling returns linear; the sRGB swapchain re-encodes on write.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, gPanoW, gPanoH, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, gPanoPixels.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    LOGI("pano texture uploaded %dx%d", gPanoW, gPanoH);
+}
 
 // ---- EGL ----
 static bool initEGL() {
@@ -254,6 +361,8 @@ static void handleEvents() {
 static void renderFrame() {
     if (!gSessionReady) return;
 
+    uploadPanoIfNeeded();  // GL context is current on this thread
+
     XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState = {XR_TYPE_FRAME_STATE};
     if (XR_FAILED(xrWaitFrame(gSession, &waitInfo, &frameState))) return;
@@ -292,6 +401,26 @@ static void renderFrame() {
             glClearColor(CLEAR_R, CLEAR_G, CLEAR_B, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+            // Draw the 360 panorama as the background, using this eye's fov + head orientation.
+            if (gPanoTex != 0 && gPanoProgram != 0) {
+                glDisable(GL_DEPTH_TEST);
+                glDepthMask(GL_FALSE);
+                glUseProgram(gPanoProgram);
+                const XrFovf& fov = views[i].fov;
+                const XrQuaternionf& q = views[i].pose.orientation;
+                glUniform4f(glGetUniformLocation(gPanoProgram, "uFovTan"),
+                            tanf(fov.angleLeft), tanf(fov.angleRight),
+                            tanf(fov.angleDown), tanf(fov.angleUp));
+                glUniform4f(glGetUniformLocation(gPanoProgram, "uQuat"), q.x, q.y, q.z, q.w);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, gPanoTex);
+                glUniform1i(glGetUniformLocation(gPanoProgram, "uPano"), 0);
+                glBindVertexArray(gPanoVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                glBindVertexArray(0);
+                glDepthMask(GL_TRUE);
+            }
+
             XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             xrReleaseSwapchainImage(gSwapchains[i].handle, &relInfo);
 
@@ -319,6 +448,9 @@ static void renderFrame() {
 
 // ---- Cleanup ----
 static void shutdownOpenXR() {
+    if (gPanoTex)     { glDeleteTextures(1, &gPanoTex); gPanoTex = 0; }
+    if (gPanoVAO)     { glDeleteVertexArrays(1, &gPanoVAO); gPanoVAO = 0; }
+    if (gPanoProgram) { glDeleteProgram(gPanoProgram); gPanoProgram = 0; }
     for (auto& sc : gSwapchains) {
         if (!sc.framebuffers.empty()) glDeleteFramebuffers(sc.framebuffers.size(), sc.framebuffers.data());
         if (!sc.depthBuffers.empty()) glDeleteRenderbuffers(sc.depthBuffers.size(), sc.depthBuffers.data());
@@ -338,6 +470,8 @@ static void renderThreadFunc() {
     if (!initEGL()) { LOGE("EGL init failed"); return; }
     if (!initOpenXR()) { LOGE("OpenXR init failed"); shutdownEGL(); return; }
 
+    initPanoProgram();
+
     LOGI("VR render loop starting");
     while (gRunning) {
         handleEvents();
@@ -355,6 +489,22 @@ extern "C" {
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     gJvm = vm;
     return JNI_VERSION_1_6;
+}
+
+JNIEXPORT void JNICALL
+Java_com_quest_lobby_MainActivity_nativeSetPanorama(JNIEnv* env, jobject, jint w, jint h, jobject buffer) {
+    void* addr = env->GetDirectBufferAddress(buffer);
+    if (!addr || w <= 0 || h <= 0) {
+        LOGE("nativeSetPanorama: bad input (addr=%p, %dx%d)", addr, w, h);
+        return;
+    }
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    uint8_t* p = (uint8_t*)addr;
+    gPanoPixels.assign(p, p + bytes);
+    gPanoW = w;
+    gPanoH = h;
+    gPanoDirty = true;   // render thread uploads it on the next frame
+    LOGI("nativeSetPanorama received %dx%d", w, h);
 }
 
 JNIEXPORT void JNICALL

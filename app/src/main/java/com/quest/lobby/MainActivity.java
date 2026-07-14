@@ -3,6 +3,7 @@ package com.quest.lobby;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AppOpsManager;
+import android.app.admin.DevicePolicyManager;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
 import android.content.ComponentName;
@@ -53,6 +54,9 @@ public class MainActivity extends Activity {
 
     private String serverUrl;
     private String roomId = DEFAULT_ROOM_ID;
+    // Client identity (clientId / headsetId) sent to the server AND passed to Content — now
+    // the device IPv4 instead of the headset SN. Cached so every use is the exact same value.
+    private String cachedClientId;
 
     private static final long RECONNECT_DELAY_MS = 3000;
 
@@ -62,6 +66,8 @@ public class MainActivity extends Activity {
 
     private native void nativeCreate();
     private native void nativeDestroy();
+    // Hand the decoded 360 panorama (RGBA8, row 0 = top) to the native render thread.
+    private native void nativeSetPanorama(int width, int height, java.nio.ByteBuffer pixels);
 
     private static final String DEFAULT_CONTENT_PACKAGE = "com.quest.content";
     // Ultra-aggressive check interval — user wants instant Meta menu → Content
@@ -131,9 +137,12 @@ public class MainActivity extends Activity {
             Log.w(TAG, "Storage: MANAGE_EXTERNAL_STORAGE NOT granted. Run: adb shell appops set --uid " + getPackageName() + " MANAGE_EXTERNAL_STORAGE allow");
         }
 
+        enableLockTaskWhitelist();
+
         serverUrl = buildServerUrl();
         Log.d(TAG, "Server URL: " + serverUrl);
 
+        loadPanorama();   // stash pixels before the render thread starts
         nativeCreate();
         registerNetworkCallback();
         connectWebSocket();
@@ -143,6 +152,8 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         isRunning = true;
+
+        startKioskLockTask();
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         boolean shouldRun = prefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
@@ -234,14 +245,19 @@ public class MainActivity extends Activity {
             public void onAvailable(Network network) {
                 Log.d(TAG, "Network available");
                 mainHandler.post(() -> {
-                    // CRITICAL: only reconnect if Lobby is actually in foreground.
-                    // Otherwise Content is the active client; reconnecting would
-                    // evict Content from the server (same clientId conflict).
-                    if (!isRunning) {
-                        Log.d(TAG, "Network available, but Lobby is background — NOT reconnecting (Content owns clientId)");
+                    // Only skip reconnect if Content is ACTUALLY running and owns the clientId.
+                    // (Previously used !isRunning, which wrongly blocked reconnect when Content
+                    //  had died/crashed but the Activity flag was still background.)
+                    if (contentOwnsClientId()) {
+                        Log.d(TAG, "Network available, but Content is running — NOT reconnecting (Content owns clientId)");
                         return;
                     }
                     if (webSocket == null) {
+                        // The network (and therefore our IPv4 = clientId) may have changed.
+                        // Refresh the cached clientId and rebuild the URL before reconnecting,
+                        // otherwise we'd reconnect with a stale IP from the previous network.
+                        cachedClientId = null;
+                        serverUrl = buildServerUrl();
                         connectWebSocket();
                     }
                 });
@@ -266,60 +282,21 @@ public class MainActivity extends Activity {
     }
 
     private String getClientId() {
-        // Try every plausible location for the SN/ClientID, log result of each attempt.
-        String[] candidates = {
-            // App's own external dir — accessible without any permission
-            new File(getExternalFilesDir(null), "HMDSN.txt").getAbsolutePath(),
-            new File(getExternalFilesDir(null), "ClientID.txt").getAbsolutePath(),
-            // Pictures dir — needs READ_EXTERNAL_STORAGE (may fail on Android 11+ scoped storage)
-            new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
-                     "moonshineslam/ClientID.txt").getAbsolutePath(),
-            new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
-                     "moonshineslam/HMDSN.jpg").getAbsolutePath(),
-            // Direct /sdcard path (Quest may allow direct access)
-            "/sdcard/Pictures/moonshineslam/HMDSN.jpg",
-        };
-
-        for (String path : candidates) {
-            String value = tryReadFile(path);
-            if (value != null) {
-                Log.d(TAG, "ClientID loaded from " + path + ": " + value);
-                return value;
-            }
+        if (cachedClientId != null) {
+            return cachedClientId;
         }
-
+        // Client identity = device IPv4 address (previously the headset SN).
         String ip = getDeviceIpv4();
         if (ip != null) {
-            Log.d(TAG, "ClientID fallback to IPv4: " + ip);
+            Log.d(TAG, "ClientID = IPv4: " + ip);
+            cachedClientId = ip;
             return ip;
         }
+        // No IPv4 yet (network down). Use a random id but DON'T cache it, so a later call
+        // can still pick up the real IPv4 once the network is up.
         String fallback = "VR_RandomUID_" + UUID.randomUUID().toString();
-        Log.d(TAG, "ClientID fallback to random: " + fallback);
+        Log.d(TAG, "ClientID fallback to random (no IPv4 yet): " + fallback);
         return fallback;
-    }
-
-    private String tryReadFile(String path) {
-        File file = new File(path);
-        boolean exists = file.exists();
-        boolean canRead = exists && file.canRead();
-        if (!exists) {
-            Log.d(TAG, "  [" + path + "] not exists");
-            return null;
-        }
-        if (!canRead) {
-            Log.d(TAG, "  [" + path + "] exists but not readable (permission denied?)");
-            return null;
-        }
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            String line = reader.readLine();
-            if (line != null && !line.trim().isEmpty()) {
-                return line.trim();
-            }
-            Log.d(TAG, "  [" + path + "] empty");
-        } catch (Exception e) {
-            Log.e(TAG, "  [" + path + "] read failed: " + e.getMessage());
-        }
-        return null;
     }
 
     private String getDeviceIpv4() {
@@ -431,6 +408,10 @@ public class MainActivity extends Activity {
             int gamePort = connectData.optInt("port", 0);
             String connectRoomId = connectData.optString("roomId", "");
             String mapName = connectData.optString("mapName", "");
+            // NOTE: clientId is intentionally NOT passed to Content. Matching the OLD UE flow,
+            // Content derives its own identity (device IPv4, formerly the SN) independently —
+            // same device → same IPv4 → same clientId as the Lobby. Passing an extra -clientId
+            // flag deviates from the UE format and can crash Content's command-line parsing.
             String cmdLine = "-serverip=" + gameIp + ":" + gamePort
                     + " -wsserverip=" + SERVER_HOST
                     + " -wsport=" + SERVER_PORT
@@ -479,7 +460,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    private static final long LAUNCH_DELAY_AFTER_DISCONNECT_MS = 300;
+    private static final long LAUNCH_DELAY_AFTER_DISCONNECT_MS = 3000;
 
     private void launchContent(String pkg, JSONObject extras) {
         Log.d(TAG, "Try launch apk: " + pkg);
@@ -645,12 +626,30 @@ public class MainActivity extends Activity {
     }
 
     private void scheduleReconnect() {
-        if (!isRunning) return;
+        // Keep retrying unless Content is genuinely running (it owns the clientId then).
+        if (contentOwnsClientId()) return;
         mainHandler.postDelayed(() -> {
-            if (isRunning && webSocket == null) {
+            if (webSocket == null && !contentOwnsClientId()) {
                 connectWebSocket();
             }
         }, RECONNECT_DELAY_MS);
+    }
+
+    /**
+     * True only when Content was launched AND its process is still alive — i.e. Content is the
+     * legitimate owner of the shared clientId, so the Lobby must NOT reconnect and evict it.
+     * When Content has died/crashed (or was never launched), the Lobby should reconnect freely.
+     */
+    private boolean contentOwnsClientId() {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (!prefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false)) return false;
+        // During Content's startup window it OWNS the clientId even before its process is
+        // detectable — otherwise the Lobby would reconnect its WebSocket with the same clientId
+        // and evict the Content that is still coming up (Content then fails to connect / crashes).
+        long launchedAt = prefs.getLong(PREF_CONTENT_LAUNCHED_AT, 0);
+        if (System.currentTimeMillis() - launchedAt < KIOSK_LAUNCH_GRACE_MS) return true;
+        // After the startup window, only if the process is actually alive.
+        return isContentProcessAlive(currentContentPackage);
     }
 
     private void startKioskWatchdog() {
@@ -775,8 +774,25 @@ public class MainActivity extends Activity {
         return queryForegroundPackage(this);
     }
 
+    /** Latest foreground app together with the timestamp of its MOVE_TO_FOREGROUND event. */
+    public static class Foreground {
+        public final String pkg;
+        public final long time;
+        Foreground(String pkg, long time) { this.pkg = pkg; this.time = time; }
+    }
+
     /** Static so KioskService can share the same logic. */
     public static String queryForegroundPackage(Context ctx) {
+        Foreground fg = queryForeground(ctx);
+        return fg == null ? null : fg.pkg;
+    }
+
+    /**
+     * Latest foreground event (package + timestamp), or null if unavailable. The timestamp
+     * lets callers tell one Meta-menu open from the next: each open is a fresh event, so a
+     * newer timestamp means a new intrusion even if REORDER_TO_FRONT logged no return event.
+     */
+    public static Foreground queryForeground(Context ctx) {
         AppOpsManager appOps = (AppOpsManager) ctx.getSystemService(Context.APP_OPS_SERVICE);
         int mode = appOps.unsafeCheckOpNoThrow(
                 AppOpsManager.OPSTR_GET_USAGE_STATS,
@@ -800,7 +816,63 @@ public class MainActivity extends Activity {
                 latestPackage = ev.getPackageName();
             }
         }
-        return latestPackage;
+        return latestPackage == null ? null : new Foreground(latestPackage, latestTime);
+    }
+
+    /** Decode assets/scene.png and hand its pixels to native as the VR background. */
+    private void loadPanorama() {
+        try (java.io.InputStream is = getAssets().open("scene.png")) {
+            android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeStream(is);
+            if (bmp == null) {
+                Log.e(TAG, "Panorama decode failed (scene.png)");
+                return;
+            }
+            int w = bmp.getWidth();
+            int h = bmp.getHeight();
+            // ARGB_8888 copyPixelsToBuffer yields R,G,B,A byte order — matches GL_RGBA.
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(w * h * 4);
+            bmp.copyPixelsToBuffer(buf);
+            buf.rewind();
+            nativeSetPanorama(w, h, buf);   // native copies synchronously
+            bmp.recycle();
+            Log.d(TAG, "Panorama loaded: " + w + "x" + h);
+        } catch (Exception e) {
+            Log.e(TAG, "loadPanorama failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * If this app is a device owner, whitelist itself for Lock Task so startLockTask()
+     * pins silently (no confirmation, user can't leave). Set device owner once via:
+     *   adb shell dpm set-device-owner com.quest.lobby/.LobbyAdminReceiver
+     */
+    private void enableLockTaskWhitelist() {
+        try {
+            DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+            if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
+                ComponentName admin = new ComponentName(this, LobbyAdminReceiver.class);
+                dpm.setLockTaskPackages(admin, new String[]{ getPackageName() });
+                Log.d(TAG, "Lock task: device owner ✓, package whitelisted (silent kiosk)");
+            } else {
+                Log.w(TAG, "Lock task: NOT device owner — startLockTask() will prompt / be escapable. "
+                        + "Run: adb shell dpm set-device-owner " + getPackageName() + "/.LobbyAdminReceiver");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "enableLockTaskWhitelist failed: " + e.getMessage());
+        }
+    }
+
+    /** Enter Lock Task (screen pinning / kiosk) if not already in it. */
+    private void startKioskLockTask() {
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null && am.getLockTaskModeState() == ActivityManager.LOCK_TASK_MODE_NONE) {
+                startLockTask();
+                Log.d(TAG, "startLockTask() called (lockTaskState was NONE)");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "startLockTask failed: " + e.getMessage());
+        }
     }
 
     private boolean hasUsageStatsPermission() {
