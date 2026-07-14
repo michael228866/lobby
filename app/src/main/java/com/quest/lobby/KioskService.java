@@ -74,12 +74,6 @@ public class KioskService extends Service {
     private long lastInterventionMs = 0;
     private static final long MIN_INTERVENTION_INTERVAL_MS = 500;  // safety cap between pushes
 
-    // Content-dead recovery: relaunch a dead Content even when NO foreground event fires (e.g. a
-    // silent crash that doesn't bring the launcher forward). Gated by a cooldown so a Content that
-    // crashes on startup is retried at most once per window, never every 100ms tick (no crash-loop).
-    private static final long CONTENT_RESTART_COOLDOWN_MS = 8000;
-    private long lastContentRestartMs = 0;
-
     @Override
     public void onCreate() {
         super.onCreate();
@@ -135,28 +129,17 @@ public class KioskService extends Service {
         }
 
         // Decide who SHOULD own the foreground right now:
-        //  - Content, ALWAYS, as long as content_should_run == true. If Content's process died
-        //    we do NOT fall back to the Lobby — the target stays Content and we relaunch it.
-        //  - the Lobby itself only once the server has told us to stop (content_should_run=false).
+        //  - Content, ONLY when content_should_run == true AND its process is actually alive.
+        //    A live Content that lost the foreground (Meta menu / Quest home) is simply raised
+        //    back with REORDER_TO_FRONT.
+        //  - the Lobby itself otherwise. Crucially, if content_should_run == true but Content is
+        //    DEAD (crashed / force-stopped / not launched yet after a reboot), the target is the
+        //    Lobby — NOT Content. KioskService must NOT launch Content directly. Bringing the
+        //    Lobby forward lets MainActivity.onResume() run the proper recovery: reconnect the
+        //    WebSocket and send headset_check_reconnect so the SERVER decides whether Content
+        //    should start again (via a headset_game_backend_command / connect).
         boolean contentAlive = shouldRun && isAliveCached(contentPkg);
-        String target = shouldRun ? contentPkg : getPackageName();
-
-        // ── Content-dead recovery (independent of foreground events) ──────────────────
-        // If Content should be running but its process is dead and we're past the launch grace
-        // period, relaunch it PROACTIVELY — even when queryForeground() returns null (a silent
-        // crash that never brings the launcher forward wouldn't produce a foreground event, so
-        // relying on the menu path below would leave Content dead forever). The cooldown plus the
-        // content_launched_at stamp written by bringContentToFront() ensure a crash-looping
-        // Content is retried at most once per ~8s, not every 100ms tick.
-        if (shouldRun && !contentAlive) {
-            long now = System.currentTimeMillis();
-            if (now - lastContentRestartMs >= CONTENT_RESTART_COOLDOWN_MS) {
-                Log.d(TAG, "Content-dead recovery: relaunching (no foreground event required)");
-                lastContentRestartMs = now;
-                bringContentToFront(contentPkg, prefs, false);  // restores extras + stamps launch time
-            }
-            return;  // relaunch in flight or cooling down — don't run the menu/pushback logic
-        }
+        String target = (shouldRun && contentAlive) ? contentPkg : getPackageName();
 
         MainActivity.Foreground fgEvent = MainActivity.queryForeground(this);
         String fg = (fgEvent == null) ? null : fgEvent.pkg;
@@ -190,13 +173,18 @@ public class KioskService extends Service {
         lastHandledContentAlive = contentAlive;
         lastInterventionMs = now;
 
-        if (shouldRun) {
-            // Target is Content: REORDER if alive, full relaunch (with extras) if dead.
-            bringContentToFront(contentPkg, prefs, contentAlive);
+        if (shouldRun && contentAlive) {
+            // Content is the target and it's alive → just raise it back (single flash, no relaunch).
+            bringContentToFront(contentPkg, prefs, true);
         } else {
-            // Target is Lobby: server has disconnected us, keep the kiosk home in front.
+            // Target is the Lobby. Two cases land here:
+            //  (a) content_should_run == false — server disconnected us; Lobby is the kiosk home.
+            //  (b) content_should_run == true but Content is DEAD — do NOT launch Content here.
+            //      Bring the Lobby forward and let MainActivity.onResume() ask the server (via
+            //      headset_check_reconnect) whether Content should be started again.
             try {
-                Log.d(TAG, "bringing Lobby back (fg=" + fg + ")");
+                Log.d(TAG, "bringing Lobby back (fg=" + fg + ", shouldRun=" + shouldRun
+                        + ", contentAlive=" + contentAlive + ")");
                 Intent intent = new Intent(this, MainActivity.class);
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                         | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
@@ -209,43 +197,36 @@ public class KioskService extends Service {
     }
 
     /**
-     * Bring Content to the foreground.
+     * Raise the ALREADY-RUNNING Content back to the foreground with a cheap
+     * {@code REORDER_TO_FRONT} — the existing task is brought to top, no recreate, so a
+     * Meta-menu open is dismissed with a single flash.
      *
-     * <p>Content alive: cheap {@code REORDER_TO_FRONT} — the existing task is raised, no
-     * recreate, so a Meta-menu open is dismissed with a single flash.
+     * <p>IMPORTANT: this must only ever be called when Content's process is alive. KioskService
+     * deliberately does NOT launch a dead Content. When Content is dead the watchdog brings the
+     * Lobby forward instead, and MainActivity.onResume() asks the server (headset_check_reconnect)
+     * whether Content should start again — only a server "connect" command may relaunch Content.
+     * The {@code contentAlive} parameter is kept for call-site clarity and defends against misuse.
      *
-     * <p>Content dead (user closed it, or it crashed): a full relaunch. We re-attach every
-     * Intent extra that {@code MainActivity.launchContent()} originally passed (persisted as
-     * {@code content_extras_json}) so Content reconnects exactly as it did the first time —
-     * no need to wait for the server to re-send a connect command. We stamp
-     * {@code content_launched_at} first so the watchdog's launch grace period covers the
-     * startup window and doesn't fight the coming-up Content.
-     *
-     * @return true if a launch intent was dispatched.
+     * @return true if a REORDER intent was dispatched.
      */
     private boolean bringContentToFront(String contentPkg, SharedPreferences prefs, boolean contentAlive) {
+        if (!contentAlive) {
+            // Safety net: never launch a dead Content from the watchdog. Callers should have routed
+            // a dead Content to the Lobby-pullback path instead.
+            Log.w(TAG, "bringContentToFront called with contentAlive=false — ignoring (Content is "
+                    + "relaunched only via server reconnect, not by KioskService)");
+            return false;
+        }
         try {
             Intent intent = getPackageManager().getLaunchIntentForPackage(contentPkg);
             if (intent == null) {
                 Log.e(TAG, "bringContentToFront: no launch intent for " + contentPkg);
                 return false;
             }
-            if (contentAlive) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                        | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                Log.d(TAG, "Content alive -> REORDER_TO_FRONT: " + contentPkg);
-            } else {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                        | Intent.FLAG_ACTIVITY_CLEAR_TOP
-                        | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                restoreExtras(intent, prefs);
-                // Mark relaunch time so the LAUNCH_GRACE_MS window covers Content's startup.
-                prefs.edit()
-                        .putLong("content_launched_at", System.currentTimeMillis())
-                        .apply();
-                Log.d(TAG, "Content dead -> full relaunch with extras: " + contentPkg);
-            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            Log.d(TAG, "Content alive -> REORDER_TO_FRONT: " + contentPkg);
             startActivity(intent);
             return true;
         } catch (Exception e) {
@@ -259,7 +240,12 @@ public class KioskService extends Service {
      * All values were stored as Strings (Websocket / cmdLine / userId / fromApp / serverip /
      * wsserverip / wsport / roomId / useMultiVRGis / mapName / ip / port / playerheight), so we
      * re-put them as Strings to keep Content's command-line parsing identical to the first launch.
+     *
+     * <p>NOTE: currently unused in the normal flow. Kept for a possible future special case; the
+     * standard "Content dead" recovery does NOT relaunch locally — it goes back to the Lobby and
+     * lets the server drive the reconnect. See {@link #bringContentToFront}.
      */
+    @SuppressWarnings("unused")
     private void restoreExtras(Intent intent, SharedPreferences prefs) {
         String json = prefs.getString("content_extras_json", "{}");
         try {
