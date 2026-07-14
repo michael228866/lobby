@@ -14,8 +14,11 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
 
+import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.util.Iterator;
 
 /**
  * Foreground service that runs the kiosk watchdog independently of Activity lifecycle.
@@ -48,18 +51,34 @@ public class KioskService extends Service {
 
     // Cache pidof result for this long — running it every 100ms eats CPU and may
     // slow down Content's rendering, causing the "Meta menu dismiss slowly covers Content" issue.
-    private static final long PID_CACHE_MS = 2000;
+    // Kept short (300ms) so a just-closed/crashed Content is detected as dead almost immediately
+    // and we relaunch it, instead of treating it as alive for up to 2s and only REORDER-ing.
+    private static final long PID_CACHE_MS = 300;
     private long lastPidCheckTime = 0;
     private boolean lastPidAlive = false;
 
-    // "Flash once per menu-open" state: we push the target back only when we see a foreground
-    // event NEWER than the one we last handled. Each Meta-menu open is a fresh event with a
-    // new timestamp, so every open flashes exactly once; while the same menu stays open the
-    // timestamp doesn't change, so we don't keep fighting (no "一直閃"). This works even though
-    // REORDER_TO_FRONT produces no "Lobby returned" event to reset on.
+    // "Handle each intrusion once" state. We push the target back only when the situation is
+    // genuinely NEW, judged by three things together:
+    //   - fgEvent.time : each Meta-menu open is a fresh event with a newer timestamp
+    //   - target       : who should own the foreground now (Content vs Lobby) — changes on
+    //                     connect/disconnect, so a target switch must re-trigger a pushback
+    //   - contentAlive : Content alive->dead means a REORDER is no longer enough and we must
+    //                     do a full relaunch, so this transition must re-trigger too
+    // While the same menu stays open over an unchanged (time, target, alive) tuple we do NOT
+    // keep fighting, so there is no continuous flashing ("一直閃"). Relying on fgEvent.time
+    // alone was the bug: if the first pushback saw Content alive but failed, a later tick with
+    // Content now dead had the same timestamp and was skipped forever — Content never restarted.
     private long lastHandledFgTime = 0;
+    private String lastHandledTarget = null;
+    private boolean lastHandledContentAlive = false;
     private long lastInterventionMs = 0;
     private static final long MIN_INTERVENTION_INTERVAL_MS = 500;  // safety cap between pushes
+
+    // Content-dead recovery: relaunch a dead Content even when NO foreground event fires (e.g. a
+    // silent crash that doesn't bring the launcher forward). Gated by a cooldown so a Content that
+    // crashes on startup is retried at most once per window, never every 100ms tick (no crash-loop).
+    private static final long CONTENT_RESTART_COOLDOWN_MS = 8000;
+    private long lastContentRestartMs = 0;
 
     @Override
     public void onCreate() {
@@ -107,19 +126,37 @@ public class KioskService extends Service {
 
         SharedPreferences prefs = getSharedPreferences("lobby_state", MODE_PRIVATE);
         boolean shouldRun = prefs.getBoolean("content_should_run", false);
-        String contentPkg = prefs.getString("content_package", "com.moondream.HellVR");
+        String contentPkg = prefs.getString("content_package", MainActivity.DEFAULT_CONTENT_PACKAGE);
 
-        // While Content is legitimately starting up, don't fight it.
+        // While Content is legitimately starting up (or was just relaunched by us), don't fight it.
         if (shouldRun) {
             long launchedAt = prefs.getLong("content_launched_at", 0);
             if (System.currentTimeMillis() - launchedAt < LAUNCH_GRACE_MS) return;
         }
 
         // Decide who SHOULD own the foreground right now:
-        //  - Content, if it was launched and its process is still alive
-        //  - otherwise the Lobby itself — it is the kiosk home and must stay in front
-        boolean contentShouldOwn = shouldRun && isAliveCached(contentPkg);
-        String target = contentShouldOwn ? contentPkg : getPackageName();
+        //  - Content, ALWAYS, as long as content_should_run == true. If Content's process died
+        //    we do NOT fall back to the Lobby — the target stays Content and we relaunch it.
+        //  - the Lobby itself only once the server has told us to stop (content_should_run=false).
+        boolean contentAlive = shouldRun && isAliveCached(contentPkg);
+        String target = shouldRun ? contentPkg : getPackageName();
+
+        // ── Content-dead recovery (independent of foreground events) ──────────────────
+        // If Content should be running but its process is dead and we're past the launch grace
+        // period, relaunch it PROACTIVELY — even when queryForeground() returns null (a silent
+        // crash that never brings the launcher forward wouldn't produce a foreground event, so
+        // relying on the menu path below would leave Content dead forever). The cooldown plus the
+        // content_launched_at stamp written by bringContentToFront() ensure a crash-looping
+        // Content is retried at most once per ~8s, not every 100ms tick.
+        if (shouldRun && !contentAlive) {
+            long now = System.currentTimeMillis();
+            if (now - lastContentRestartMs >= CONTENT_RESTART_COOLDOWN_MS) {
+                Log.d(TAG, "Content-dead recovery: relaunching (no foreground event required)");
+                lastContentRestartMs = now;
+                bringContentToFront(contentPkg, prefs, false);  // restores extras + stamps launch time
+            }
+            return;  // relaunch in flight or cooling down — don't run the menu/pushback logic
+        }
 
         MainActivity.Foreground fgEvent = MainActivity.queryForeground(this);
         String fg = (fgEvent == null) ? null : fgEvent.pkg;
@@ -133,35 +170,107 @@ public class KioskService extends Service {
 
         // A different app grabbed the foreground (Meta menu / Quest home / other).
         if (!fg.equals(lastLoggedFg)) {
-            Log.d(TAG, "foreground -> " + fg + " @" + fgEvent.time + "  (target=" + target + ")");
+            Log.d(TAG, "foreground -> " + fg + " @" + fgEvent.time
+                    + "  (target=" + target + ", contentAlive=" + contentAlive + ")");
             lastLoggedFg = fg;
         }
 
-        // Push the target back once per NEW foreground event. Each Meta-menu open produces a
-        // newer timestamp, so every open flashes exactly once; while the same menu stays open
-        // the timestamp is unchanged, so we don't keep fighting (no continuous flashing).
-        if (fgEvent.time <= lastHandledFgTime) return;
+        // Handle each intrusion once. The situation is "new" (worth another pushback) if ANY of
+        // the foreground event, the target, or Content's alive state changed since last handled.
+        // Same (time, target, alive) => same unresolved intrusion => skip, so no continuous flash.
+        boolean sameSituation = fgEvent.time <= lastHandledFgTime
+                && target.equals(lastHandledTarget)
+                && contentAlive == lastHandledContentAlive;
+        if (sameSituation) return;
+
         long now = System.currentTimeMillis();
         if (now - lastInterventionMs < MIN_INTERVENTION_INTERVAL_MS) return;  // safety cap
         lastHandledFgTime = fgEvent.time;
+        lastHandledTarget = target;
+        lastHandledContentAlive = contentAlive;
         lastInterventionMs = now;
 
-        try {
-            Intent intent;
-            if (contentShouldOwn) {
-                Log.d(TAG, "bringing Content back (fg=" + fg + ")");
-                intent = getPackageManager().getLaunchIntentForPackage(contentPkg);
-                if (intent == null) return;
-            } else {
+        if (shouldRun) {
+            // Target is Content: REORDER if alive, full relaunch (with extras) if dead.
+            bringContentToFront(contentPkg, prefs, contentAlive);
+        } else {
+            // Target is Lobby: server has disconnected us, keep the kiosk home in front.
+            try {
                 Log.d(TAG, "bringing Lobby back (fg=" + fg + ")");
-                intent = new Intent(this, MainActivity.class);
+                Intent intent = new Intent(this, MainActivity.class);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(intent);
+            } catch (Exception e) {
+                Log.e(TAG, "KioskService Lobby bring-back failed: " + e.getMessage());
             }
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                    | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        }
+    }
+
+    /**
+     * Bring Content to the foreground.
+     *
+     * <p>Content alive: cheap {@code REORDER_TO_FRONT} — the existing task is raised, no
+     * recreate, so a Meta-menu open is dismissed with a single flash.
+     *
+     * <p>Content dead (user closed it, or it crashed): a full relaunch. We re-attach every
+     * Intent extra that {@code MainActivity.launchContent()} originally passed (persisted as
+     * {@code content_extras_json}) so Content reconnects exactly as it did the first time —
+     * no need to wait for the server to re-send a connect command. We stamp
+     * {@code content_launched_at} first so the watchdog's launch grace period covers the
+     * startup window and doesn't fight the coming-up Content.
+     *
+     * @return true if a launch intent was dispatched.
+     */
+    private boolean bringContentToFront(String contentPkg, SharedPreferences prefs, boolean contentAlive) {
+        try {
+            Intent intent = getPackageManager().getLaunchIntentForPackage(contentPkg);
+            if (intent == null) {
+                Log.e(TAG, "bringContentToFront: no launch intent for " + contentPkg);
+                return false;
+            }
+            if (contentAlive) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                Log.d(TAG, "Content alive -> REORDER_TO_FRONT: " + contentPkg);
+            } else {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                restoreExtras(intent, prefs);
+                // Mark relaunch time so the LAUNCH_GRACE_MS window covers Content's startup.
+                prefs.edit()
+                        .putLong("content_launched_at", System.currentTimeMillis())
+                        .apply();
+                Log.d(TAG, "Content dead -> full relaunch with extras: " + contentPkg);
+            }
             startActivity(intent);
+            return true;
         } catch (Exception e) {
-            Log.e(TAG, "KioskService bring-back failed: " + e.getMessage());
+            Log.e(TAG, "bringContentToFront failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Re-attach the original Content Intent extras persisted by MainActivity.launchContent().
+     * All values were stored as Strings (Websocket / cmdLine / userId / fromApp / serverip /
+     * wsserverip / wsport / roomId / useMultiVRGis / mapName / ip / port / playerheight), so we
+     * re-put them as Strings to keep Content's command-line parsing identical to the first launch.
+     */
+    private void restoreExtras(Intent intent, SharedPreferences prefs) {
+        String json = prefs.getString("content_extras_json", "{}");
+        try {
+            JSONObject extras = new JSONObject(json);
+            Iterator<String> keys = extras.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                intent.putExtra(key, extras.optString(key));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "restoreExtras parse error: " + e.getMessage());
         }
     }
 

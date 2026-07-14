@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
@@ -69,9 +70,9 @@ public class MainActivity extends Activity {
     // Hand the decoded 360 panorama (RGBA8, row 0 = top) to the native render thread.
     private native void nativeSetPanorama(int width, int height, java.nio.ByteBuffer pixels);
 
-    private static final String DEFAULT_CONTENT_PACKAGE = "com.quest.content";
-    // Ultra-aggressive check interval — user wants instant Meta menu → Content
-    private static final long KIOSK_CHECK_INTERVAL_MS = 100;
+    // Shared with KioskService so the watchdog's default target matches this Activity's
+    // default before SharedPreferences (content_package) has been written by launchContent().
+    static final String DEFAULT_CONTENT_PACKAGE = "com.quest.content";
     // Skip watchdog checks during Content's initial startup so we don't fight with it
     private static final long KIOSK_LAUNCH_GRACE_MS = 8000;
     private static final String PREFS = "lobby_state";
@@ -89,13 +90,31 @@ public class MainActivity extends Activity {
     private String currentContentPackage = DEFAULT_CONTENT_PACKAGE;
 
     private OkHttpClient client;
-    private WebSocket webSocket;
+    private volatile WebSocket webSocket;
     private Handler mainHandler;
-    private boolean isRunning = false;
     private boolean contentLaunched = false;
     private boolean pendingCheckReconnect = false;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+
+    // ── WebSocket / network-migration state machine ─────────────────────────────
+    // socketState tracks the ONE live socket; there is never more than one at a time.
+    //   DISCONNECTED → CONNECTING (connectWebSocket) → CONNECTED (onOpen)
+    //   any state → DISCONNECTED (onClosed/onFailure/migration/manual close)
+    private enum SocketState { DISCONNECTED, CONNECTING, CONNECTED }
+    private volatile SocketState socketState = SocketState.DISCONNECTED;
+    // IPv4 the in-flight connect is based on; promoted to connectedSocketIpv4 only on onOpen.
+    private volatile String pendingSocketIpv4;
+    // IPv4 the currently-CONNECTED socket was actually established on (confirmed by onOpen).
+    private volatile String connectedSocketIpv4;
+    // Last IPv4 we started a (re)connection for — used to log migrations and detect IP changes.
+    private String lastConnectedIpv4;
+    // The network we currently believe is active, refreshed from getActiveNetwork().
+    private Network activeNetwork;
+    private int networkIpRetryCount = 0;
+    private static final long NETWORK_DEBOUNCE_MS = 1000;
+    private static final long NETWORK_IP_RETRY_MS = 1000;
+    private static final int NETWORK_IP_MAX_RETRIES = 15;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -151,7 +170,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        isRunning = true;
 
         startKioskLockTask();
 
@@ -213,15 +231,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        isRunning = false;
-        // Watchdog is now handled by KioskService (foreground service) — see onCreate.
-        // No need to start Activity-based watchdog here.
+        // Watchdog is handled solely by KioskService (foreground service) — see onCreate.
+        // The Activity intentionally runs NO watchdog, so there is only one watchdog owner.
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        isRunning = false;
+        mainHandler.removeCallbacks(networkReconnectRunnable);
+        mainHandler.removeCallbacks(reconnectRunnable);
         if (networkCallback != null) {
             connectivityManager.unregisterNetworkCallback(networkCallback);
             networkCallback = null;
@@ -230,6 +248,7 @@ public class MainActivity extends Activity {
             webSocket.close(1000, "App destroyed");
             webSocket = null;
         }
+        socketState = SocketState.DISCONNECTED;
         nativeDestroy();
         FileLogger.stop();
     }
@@ -241,35 +260,147 @@ public class MainActivity extends Activity {
                 .build();
 
         networkCallback = new ConnectivityManager.NetworkCallback() {
+            // A Wi-Fi / subnet migration rarely presents cleanly as a single onAvailable. We
+            // therefore react to EVERY transport/link signal and let handleNetworkChanged()
+            // debounce the flurry into one reconnect decision (networkReconnectRunnable), which
+            // compares the CURRENT IPv4 against the connected one and only rebuilds when it moved.
             @Override
             public void onAvailable(Network network) {
-                Log.d(TAG, "Network available");
-                mainHandler.post(() -> {
-                    // Only skip reconnect if Content is ACTUALLY running and owns the clientId.
-                    // (Previously used !isRunning, which wrongly blocked reconnect when Content
-                    //  had died/crashed but the Activity flag was still background.)
-                    if (contentOwnsClientId()) {
-                        Log.d(TAG, "Network available, but Content is running — NOT reconnecting (Content owns clientId)");
-                        return;
-                    }
-                    if (webSocket == null) {
-                        // The network (and therefore our IPv4 = clientId) may have changed.
-                        // Refresh the cached clientId and rebuild the URL before reconnecting,
-                        // otherwise we'd reconnect with a stale IP from the previous network.
-                        cachedClientId = null;
-                        serverUrl = buildServerUrl();
-                        connectWebSocket();
-                    }
-                });
+                Log.d(TAG, "onAvailable: " + network);
+                refreshActiveNetwork();
+                handleNetworkChanged("onAvailable");
+            }
+
+            @Override
+            public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+                boolean wifi = caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+                boolean validated = caps != null
+                        && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                refreshActiveNetwork();
+                handleNetworkChanged("onCapabilitiesChanged(wifi=" + wifi + ",validated=" + validated + ")");
+            }
+
+            @Override
+            public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
+                // Route/interface/address changes (e.g. DHCP hands out a new IPv4 on the same
+                // Network object) surface here even when no onAvailable fires.
+                refreshActiveNetwork();
+                handleNetworkChanged("onLinkPropertiesChanged");
             }
 
             @Override
             public void onLost(Network network) {
-                Log.d(TAG, "Network lost");
+                // Do NOT blindly tear down: during a Wi-Fi switch the NEW network is often up and
+                // active before the OLD one reports lost. Only react if the network that dropped
+                // was our active one, or if nothing usable remains.
+                Network current = (connectivityManager != null)
+                        ? connectivityManager.getActiveNetwork() : null;
+                boolean lostActive = network.equals(activeNetwork);
+                Log.d(TAG, "onLost: " + network + " (active=" + activeNetwork
+                        + ", nowActive=" + current + ", lostActive=" + lostActive + ")");
+                if (current == null) {
+                    activeNetwork = null;
+                    handleNetworkChanged("onLost(no-active-remaining)");
+                } else if (lostActive) {
+                    activeNetwork = current;
+                    handleNetworkChanged("onLost(active-migrated)");
+                } else {
+                    Log.d(TAG, "onLost: a non-active network dropped — keeping current socket");
+                }
             }
         };
 
         connectivityManager.registerNetworkCallback(request, networkCallback);
+    }
+
+    private void refreshActiveNetwork() {
+        if (connectivityManager != null) {
+            activeNetwork = connectivityManager.getActiveNetwork();
+        }
+    }
+
+    /** Debounce a burst of network callbacks into a single reconnect decision. */
+    private void handleNetworkChanged(String reason) {
+        Log.d(TAG, "Network changed (" + reason + ")");
+        mainHandler.removeCallbacks(networkReconnectRunnable);
+        mainHandler.postDelayed(networkReconnectRunnable, NETWORK_DEBOUNCE_MS);
+    }
+
+    /**
+     * Settled network-change handler. Decides whether the current IPv4 warrants a full WebSocket
+     * migration. Always runs on the main thread (posted via handleNetworkChanged).
+     */
+    private final Runnable networkReconnectRunnable = new Runnable() {
+        @Override
+        public void run() {
+            // Content owns the shared clientId while it runs — the Lobby must not reconnect and
+            // evict it, even across a network change. Re-evaluate once Content is gone.
+            if (contentOwnsClientId()) {
+                Log.d(TAG, "Network changed but Content owns clientId; Lobby will not reconnect");
+                return;
+            }
+
+            String currentIpv4 = getDeviceIpv4();
+            if (currentIpv4 == null || currentIpv4.isEmpty()) {
+                Log.w(TAG, "Network changed but IPv4 is not ready yet");
+                scheduleNetworkIpRetry();
+                return;
+            }
+            networkIpRetryCount = 0;
+
+            // Nothing actually moved and we already have a live socket → no-op (avoids the
+            // needless teardown/reconnect that a stream of capability callbacks would cause).
+            if (currentIpv4.equals(connectedSocketIpv4) && socketState == SocketState.CONNECTED) {
+                Log.d(TAG, "Network callback received but IPv4 and WebSocket are unchanged ("
+                        + currentIpv4 + ")");
+                return;
+            }
+
+            reconnectForNewIpv4(currentIpv4);
+        }
+    };
+
+    /** IPv4 not assigned yet after a network event — retry the settled handler a few times. */
+    private void scheduleNetworkIpRetry() {
+        if (networkIpRetryCount >= NETWORK_IP_MAX_RETRIES) {
+            Log.w(TAG, "IPv4 still not ready after " + networkIpRetryCount
+                    + " retries; waiting for next network event");
+            networkIpRetryCount = 0;
+            return;
+        }
+        networkIpRetryCount++;
+        mainHandler.removeCallbacks(networkReconnectRunnable);
+        mainHandler.postDelayed(networkReconnectRunnable, NETWORK_IP_RETRY_MS);
+    }
+
+    /**
+     * Full network migration: drop the old socket, forget the cached clientId, rebuild the URL
+     * from the NEW IPv4, and open a fresh socket. Old-socket callbacks that arrive after this are
+     * ignored via the {@code webSocket != ws} stale check in the listener.
+     */
+    private void reconnectForNewIpv4(String newIpv4) {
+        Log.d(TAG, "Network migration: " + lastConnectedIpv4 + " -> " + newIpv4);
+
+        // Cancel any pending plain reconnect so it can't race the migration.
+        mainHandler.removeCallbacks(reconnectRunnable);
+
+        WebSocket oldSocket = webSocket;
+        webSocket = null;
+        socketState = SocketState.DISCONNECTED;
+        connectedSocketIpv4 = null;
+        if (oldSocket != null) {
+            try {
+                oldSocket.cancel();   // immediate teardown; its later callbacks are stale-checked
+            } catch (Exception ignored) {
+            }
+        }
+
+        // Force getClientId() to re-read the NEW IPv4 so buildServerUrl() can't reuse the old one.
+        cachedClientId = null;
+        serverUrl = buildServerUrl();
+        lastConnectedIpv4 = newIpv4;
+
+        connectWebSocket();
     }
 
     private String buildServerUrl() {
@@ -320,14 +451,31 @@ public class MainActivity extends Activity {
     }
 
     private void connectWebSocket() {
-        Log.d(TAG, "Connecting to " + serverUrl);
+        // The IPv4 this socket is being opened on. Held pending until onOpen confirms success —
+        // we must NOT treat a not-yet-open IP as the connected one (see onOpen).
+        pendingSocketIpv4 = getDeviceIpv4();
+        socketState = SocketState.CONNECTING;
+
+        // Diagnostics for cross-subnet reachability debugging (issue #8): if the current IPv4 is
+        // on a subnet with no route to SERVER_HOST, the connect below will fail — this makes the
+        // "why can't it reach 192.168.99.200" case obvious in logcat.
+        Log.d(TAG, "Connecting WebSocket"
+                + " | currentIPv4=" + pendingSocketIpv4
+                + " | server=" + SERVER_HOST + ":" + SERVER_PORT
+                + " | activeNetwork=" + activeNetwork
+                + " | url=" + serverUrl);
 
         Request request = new Request.Builder().url(serverUrl).build();
 
         webSocket = client.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket ws, Response response) {
-                Log.d(TAG, "WebSocket connected (as Lobby)");
+                if (webSocket != ws) { Log.d(TAG, "Ignoring onOpen from stale WebSocket"); return; }
+                socketState = SocketState.CONNECTED;
+                // Only NOW is the new IPv4 actually connected — promote pending → connected.
+                connectedSocketIpv4 = pendingSocketIpv4;
+                if (connectedSocketIpv4 != null) lastConnectedIpv4 = connectedSocketIpv4;
+                Log.d(TAG, "WebSocket connected (as Lobby) on IPv4=" + connectedSocketIpv4);
                 // If we returned from a previous Content session, ask server whether
                 // the game is still active. Server replies with headset_game_backend_command
                 // if active, silent otherwise.
@@ -339,12 +487,14 @@ public class MainActivity extends Activity {
 
             @Override
             public void onMessage(WebSocket ws, String text) {
+                if (webSocket != ws) { Log.d(TAG, "Ignoring onMessage from stale WebSocket"); return; }
                 Log.d(TAG, "Received: " + text);
                 handleMessage(text);
             }
 
             @Override
             public void onMessage(WebSocket ws, ByteString bytes) {
+                if (webSocket != ws) return;  // stale
                 String text = bytes.utf8();
                 Log.d(TAG, "Received (binary): " + text);
                 handleMessage(text);
@@ -352,15 +502,28 @@ public class MainActivity extends Activity {
 
             @Override
             public void onClosed(WebSocket ws, int code, String reason) {
+                // A migration/manual-close already replaced or nulled webSocket — ignore the old
+                // socket's late callback so it can't clobber the new socket's state.
+                if (webSocket != ws) { Log.d(TAG, "Ignoring onClosed from stale WebSocket"); return; }
                 Log.d(TAG, "WebSocket closed: " + reason);
                 webSocket = null;
+                socketState = SocketState.DISCONNECTED;
+                connectedSocketIpv4 = null;
                 scheduleReconnect();
             }
 
             @Override
             public void onFailure(WebSocket ws, Throwable t, Response response) {
-                Log.e(TAG, "WebSocket failed: " + t.getMessage());
+                if (webSocket != ws) { Log.d(TAG, "Ignoring onFailure from stale WebSocket"); return; }
+                // Log the exception TYPE (issue #8): ConnectException/SocketTimeoutException here
+                // typically means the current subnet has no route to SERVER_HOST.
+                Log.e(TAG, "WebSocket failed: " + t.getClass().getSimpleName() + ": " + t.getMessage()
+                        + " | currentIPv4=" + getDeviceIpv4()
+                        + " | server=" + SERVER_HOST + ":" + SERVER_PORT
+                        + " | url=" + serverUrl);
                 webSocket = null;
+                socketState = SocketState.DISCONNECTED;
+                connectedSocketIpv4 = null;
                 scheduleReconnect();
             }
         });
@@ -489,9 +652,12 @@ public class MainActivity extends Activity {
         // Content uses the same clientId — server must release the old session
         // first or Content's connection will hang in "connecting" state.
         if (webSocket != null) {
-            webSocket.close(1000, "Launching Content");  // polite close frame
-            webSocket.cancel();                          // immediate TCP teardown
-            webSocket = null;
+            WebSocket ws = webSocket;
+            webSocket = null;                            // null FIRST so late callbacks are stale
+            socketState = SocketState.DISCONNECTED;
+            connectedSocketIpv4 = null;
+            ws.close(1000, "Launching Content");         // polite close frame
+            ws.cancel();                                 // immediate TCP teardown
             Log.d(TAG, "WebSocket force-disconnected, waiting " + LAUNCH_DELAY_AFTER_DISCONNECT_MS
                     + "ms before launch (let server release clientId)");
         }
@@ -625,14 +791,33 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void scheduleReconnect() {
-        // Keep retrying unless Content is genuinely running (it owns the clientId then).
-        if (contentOwnsClientId()) return;
-        mainHandler.postDelayed(() -> {
+    // Plain periodic reconnect (server unreachable / transient drop). Named so a network
+    // migration can cancel a queued attempt before starting its own fresh connect.
+    private final Runnable reconnectRunnable = new Runnable() {
+        @Override
+        public void run() {
             if (webSocket == null && !contentOwnsClientId()) {
+                // Re-read IPv4 first: the drop may itself have been a network change, so rebuild
+                // the URL from the current IPv4 rather than reconnecting on a stale one.
+                String currentIpv4 = getDeviceIpv4();
+                if (currentIpv4 != null && !currentIpv4.equals(lastConnectedIpv4)) {
+                    cachedClientId = null;
+                    serverUrl = buildServerUrl();
+                    lastConnectedIpv4 = currentIpv4;
+                }
                 connectWebSocket();
             }
-        }, RECONNECT_DELAY_MS);
+        }
+    };
+
+    private void scheduleReconnect() {
+        // Keep retrying unless Content is genuinely running (it owns the clientId then).
+        // When the server is simply unreachable (e.g. current Wi-Fi has no route to SERVER_HOST),
+        // this keeps us in DISCONNECTED and retries; a later network migration to a reachable
+        // subnet reconnects automatically.
+        if (contentOwnsClientId()) return;
+        mainHandler.removeCallbacks(reconnectRunnable);
+        mainHandler.postDelayed(reconnectRunnable, RECONNECT_DELAY_MS);
     }
 
     /**
@@ -650,77 +835,6 @@ public class MainActivity extends Activity {
         if (System.currentTimeMillis() - launchedAt < KIOSK_LAUNCH_GRACE_MS) return true;
         // After the startup window, only if the process is actually alive.
         return isContentProcessAlive(currentContentPackage);
-    }
-
-    private void startKioskWatchdog() {
-        mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
-    }
-
-    private void kioskCheck() {
-        if (isRunning) return; // Lobby is in foreground per internal flag, no action
-
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        long launchedAt = prefs.getLong(PREF_CONTENT_LAUNCHED_AT, 0);
-        long sinceLaunch = System.currentTimeMillis() - launchedAt;
-
-        // Grace period — don't interfere during Content's initial startup
-        if (sinceLaunch < KIOSK_LAUNCH_GRACE_MS) {
-            mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
-            return;
-        }
-
-        String fg = getForegroundPackage();
-
-        // Foreground unknown (null) — happens with UE native rendering apps that don't
-        // trigger normal MOVE_TO_FOREGROUND events. Don't assume anything, just monitor.
-        if (fg == null) {
-            mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
-            return;
-        }
-
-        // Content already in foreground → just keep monitoring
-        if (fg.equals(currentContentPackage)) {
-            mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
-            return;
-        }
-
-        // Lobby already in foreground (state mismatch with isRunning flag) → just monitor
-        if (fg.equals(getPackageName())) {
-            mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
-            return;
-        }
-
-        boolean shouldRun = prefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
-
-        // Process alive → bring Content directly back (no Lobby flash, no WS conflict)
-        if (shouldRun && isContentProcessAlive(currentContentPackage)) {
-            Log.d(TAG, "Kiosk FAST: fg=" + fg + ", Content alive, bringing Content back");
-            try {
-                PackageManager pm = getPackageManager();
-                Intent intent = pm.getLaunchIntentForPackage(currentContentPackage);
-                if (intent != null) {
-                    // FLAG_ACTIVITY_REORDER_TO_FRONT: if Content's task exists, just bring it
-                    //   to top (no recreate, faster, no flash)
-                    // FLAG_ACTIVITY_SINGLE_TOP: don't create new instance if it's already on top
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                            | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                    startActivity(intent);
-                    mainHandler.postDelayed(this::kioskCheck, KIOSK_CHECK_INTERVAL_MS);
-                    return;
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Kiosk FAST failed: " + e.getMessage());
-            }
-        }
-
-        Log.d(TAG, "Kiosk SLOW: fg=" + fg + ", Content dead — bringing Lobby back");
-
-        // SLOW PATH: process dead → bring Lobby back (Lobby asks server)
-        Log.d(TAG, "Kiosk SLOW: bringing Lobby back");
-        Intent intent = new Intent(this, MainActivity.class);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        startActivity(intent);
     }
 
     /**
@@ -757,17 +871,6 @@ public class MainActivity extends Activity {
             Log.e(TAG, "shell '" + cmd + "' failed: " + e.getMessage());
             return null;
         }
-    }
-
-    private boolean isContentRunning() {
-        String fg = getForegroundPackage();
-        if (fg == null) {
-            // No permission or no data — assume content is running to avoid loop
-            return true;
-        }
-        boolean isContent = currentContentPackage.equals(fg);
-        Log.d(TAG, "Foreground package: " + fg + " (isContent=" + isContent + ")");
-        return isContent;
     }
 
     private String getForegroundPackage() {
