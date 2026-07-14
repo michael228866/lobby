@@ -128,18 +128,23 @@ public class KioskService extends Service {
             if (System.currentTimeMillis() - launchedAt < LAUNCH_GRACE_MS) return;
         }
 
-        // Decide who SHOULD own the foreground right now:
-        //  - Content, ONLY when content_should_run == true AND its process is actually alive.
-        //    A live Content that lost the foreground (Meta menu / Quest home) is simply raised
-        //    back with REORDER_TO_FRONT.
-        //  - the Lobby itself otherwise. Crucially, if content_should_run == true but Content is
-        //    DEAD (crashed / force-stopped / not launched yet after a reboot), the target is the
-        //    Lobby — NOT Content. KioskService must NOT launch Content directly. Bringing the
-        //    Lobby forward lets MainActivity.onResume() run the proper recovery: reconnect the
-        //    WebSocket and send headset_check_reconnect so the SERVER decides whether Content
-        //    should start again (via a headset_game_backend_command / connect).
+        // Content may only be the foreground target when ALL of these hold:
+        //   content_should_run == true          — a session is meant to be active
+        //   content_session_confirmed == true   — the SERVER confirmed THIS run's session
+        //                                         (set only by launchContent after a connect cmd;
+        //                                          reset on disconnect / check-reconnect timeout /
+        //                                          fresh app start). This stops a stale
+        //                                          content_should_run=true from a previous run
+        //                                          making us jump to an unconfirmed Content.
+        //   Content process is actually alive   — we only ever REORDER a live Content, never launch.
+        // Otherwise the target is the Lobby. In particular, when Content is DEAD (crashed /
+        // force-stopped / not started yet), KioskService does NOT launch it — it brings the Lobby
+        // forward and lets MainActivity.onResume() ask the server (headset_check_reconnect) whether
+        // Content should be (re)started. Only a server connect command may launch Content.
+        boolean sessionConfirmed = prefs.getBoolean("content_session_confirmed", false);
         boolean contentAlive = shouldRun && isAliveCached(contentPkg);
-        String target = (shouldRun && contentAlive) ? contentPkg : getPackageName();
+        boolean contentIsTarget = shouldRun && sessionConfirmed && contentAlive;
+        String target = contentIsTarget ? contentPkg : getPackageName();
 
         MainActivity.Foreground fgEvent = MainActivity.queryForeground(this);
         String fg = (fgEvent == null) ? null : fgEvent.pkg;
@@ -154,7 +159,8 @@ public class KioskService extends Service {
         // A different app grabbed the foreground (Meta menu / Quest home / other).
         if (!fg.equals(lastLoggedFg)) {
             Log.d(TAG, "foreground -> " + fg + " @" + fgEvent.time
-                    + "  (target=" + target + ", contentAlive=" + contentAlive + ")");
+                    + "  (target=" + target + ", contentAlive=" + contentAlive
+                    + ", sessionConfirmed=" + sessionConfirmed + ")");
             lastLoggedFg = fg;
         }
 
@@ -173,17 +179,21 @@ public class KioskService extends Service {
         lastHandledContentAlive = contentAlive;
         lastInterventionMs = now;
 
-        if (shouldRun && contentAlive) {
-            // Content is the target and it's alive → just raise it back (single flash, no relaunch).
+        if (contentIsTarget) {
+            // Content is a server-confirmed, alive session that lost the foreground → just raise it
+            // back (single flash, no relaunch, no extras).
             bringContentToFront(contentPkg, prefs, true);
         } else {
-            // Target is the Lobby. Two cases land here:
+            // Target is the Lobby. Cases that land here:
             //  (a) content_should_run == false — server disconnected us; Lobby is the kiosk home.
-            //  (b) content_should_run == true but Content is DEAD — do NOT launch Content here.
-            //      Bring the Lobby forward and let MainActivity.onResume() ask the server (via
-            //      headset_check_reconnect) whether Content should be started again.
+            //  (b) content_should_run == true but session NOT server-confirmed — stale prefs from a
+            //      previous run; must not jump to Content until the server re-confirms.
+            //  (c) content_should_run == true but Content is DEAD — do NOT launch Content here.
+            //  In (b)/(c) bringing the Lobby forward lets MainActivity.onResume() ask the server
+            //  (headset_check_reconnect) whether Content should be started again.
             try {
                 Log.d(TAG, "bringing Lobby back (fg=" + fg + ", shouldRun=" + shouldRun
+                        + ", sessionConfirmed=" + sessionConfirmed
                         + ", contentAlive=" + contentAlive + ")");
                 Intent intent = new Intent(this, MainActivity.class);
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
