@@ -80,14 +80,6 @@ public class MainActivity extends Activity {
     private static final String PREF_CONTENT_SHOULD_RUN = "content_should_run";
     private static final String PREF_CONTENT_PACKAGE = "content_package";
     private static final String PREF_CONTENT_EXTRAS_JSON = "content_extras_json";
-    // Set true ONLY after the server confirms this run's session (connect command → launchContent).
-    // Reset on disconnect, on check-reconnect timeout, and on a fresh Activity/process start.
-    // KioskService will only hold Content in the foreground while this is true — so a stale
-    // content_should_run=true from a previous run can never make the watchdog jump to Content
-    // before the server has re-confirmed. Shared literal key with KioskService.
-    static final String PREF_CONTENT_SESSION_CONFIRMED = "content_session_confirmed";
-    // Give up waiting for the server's connect reply after this long → clear stale state, stay in Lobby.
-    private static final long CHECK_RECONNECT_TIMEOUT_MS = 8000;
     // Skip reconnecting WebSocket for this long after launching Content
     // (Content owns the clientId during this window — Lobby reconnecting would evict it)
     private static final long CONTENT_GRACE_PERIOD_MS = 60000;
@@ -152,11 +144,6 @@ public class MainActivity extends Activity {
             Log.d(TAG, "Restored currentContentPackage from prefs: " + savedPkg);
         }
 
-        // Fresh process/Activity start: the session is NOT server-confirmed yet. Force the flag
-        // false so the watchdog won't hold a stale Content in front before onResume has re-asked
-        // the server. It is set true again only when a server connect command launches Content.
-        savedPrefs.edit().putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false).apply();
-
         if (hasUsageStatsPermission()) {
             Log.d(TAG, "Kiosk mode: PACKAGE_USAGE_STATS granted ✓");
         } else {
@@ -191,34 +178,53 @@ public class MainActivity extends Activity {
         long launchedAt = prefs.getLong(PREF_CONTENT_LAUNCHED_AT, 0);
         long sinceLaunch = System.currentTimeMillis() - launchedAt;
 
-        // A previous Content session was flagged as "should be running". Content's start authority
-        // belongs to the SERVER ONLY — we must NEVER relaunch Content locally from SharedPreferences
-        // or from "process is still alive". We only ask the server (headset_check_reconnect) and let
-        // it decide: the server replies with headset_game_backend_command + connect if the game is
-        // still active (then we launchContent), or stays silent → the check-reconnect timeout fires
-        // and we clear the stale state and stay in the Lobby.
+        // Content was supposed to be running — try fast path first, fall back to server
         if (shouldRun && sinceLaunch < CONTENT_AUTO_RELAUNCH_WINDOW_MS) {
             String fg = getForegroundPackage();
 
-            // If Content is genuinely in the foreground already, don't disturb it — but do NOT
-            // relaunch it either. We still ask the server below so the session gets re-confirmed
-            // (content_session_confirmed) before the watchdog will hold Content in front.
+            // (a) Content is already in foreground — Lobby brought up by mistake, leave alone
             if (fg != null && fg.equals(currentContentPackage)) {
-                Log.d(TAG, "Content already in foreground; leaving it alone, will confirm with server");
+                Log.d(TAG, "Content is in foreground (" + fg + "), Lobby sitting tight");
+                contentLaunched = true;
+                return;
             }
 
-            Log.d(TAG, "Previous Content session found — asking server before any relaunch"
-                    + " (no local fast-path)");
+            // (b) Content not yet in foreground but recently launched — give it time
+            if (sinceLaunch < KIOSK_LAUNCH_GRACE_MS) {
+                Log.d(TAG, "Content still launching (" + sinceLaunch + "ms), waiting");
+                contentLaunched = true;
+                return;
+            }
+
+            // (c) FAST PATH: if Content process is still alive (Meta menu opened/dismissed,
+            //     or Content just paused), instantly bring it back to foreground.
+            //     No need to ask server — process exists, just resume it.
+            if (isContentProcessAlive(currentContentPackage)) {
+                String pkg = prefs.getString(PREF_CONTENT_PACKAGE, null);
+                String extrasJson = prefs.getString(PREF_CONTENT_EXTRAS_JSON, null);
+                if (pkg != null && extrasJson != null) {
+                    Log.d(TAG, "Fast path: Content process alive, switching back to: " + pkg);
+                    try {
+                        JSONObject extras = new JSONObject(extrasJson);
+                        relaunchContent(pkg, extras);
+                        return;
+                    } catch (Exception e) {
+                        Log.e(TAG, "Fast path failed: " + e.getMessage());
+                    }
+                }
+            }
+
+            // (d) SLOW PATH: process is dead. Ask server if the room is still active.
+            //     Server responds with headset_game_backend_command if active,
+            //     silent if Lobby should stay idle.
+            Log.d(TAG, "Content process dead — will query server (headset_check_reconnect)");
             pendingCheckReconnect = true;
         }
 
-        // Connect WebSocket (onOpen sends headset_check_reconnect when pendingCheckReconnect is set).
+        // Connect WebSocket (also triggers headset_check_reconnect in onOpen if flagged)
         contentLaunched = false;
         if (webSocket == null) {
             connectWebSocket();
-        } else if (pendingCheckReconnect && socketState == SocketState.CONNECTED) {
-            // Already connected — onOpen won't fire again, so ask the server right now.
-            sendCheckReconnect();
         }
     }
 
@@ -234,7 +240,6 @@ public class MainActivity extends Activity {
         super.onDestroy();
         mainHandler.removeCallbacks(networkReconnectRunnable);
         mainHandler.removeCallbacks(reconnectRunnable);
-        mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
         if (networkCallback != null) {
             connectivityManager.unregisterNetworkCallback(networkCallback);
             networkCallback = null;
@@ -471,12 +476,11 @@ public class MainActivity extends Activity {
                 connectedSocketIpv4 = pendingSocketIpv4;
                 if (connectedSocketIpv4 != null) lastConnectedIpv4 = connectedSocketIpv4;
                 Log.d(TAG, "WebSocket connected (as Lobby) on IPv4=" + connectedSocketIpv4);
-                // If we returned from a previous Content session, ask server whether the game is
-                // still active. Server replies with headset_game_backend_command + connect if
-                // active, silent otherwise. Do NOT clear pendingCheckReconnect here — it stays set
-                // until either the connect command arrives or the check-reconnect timeout fires
-                // (sendCheckReconnect arms that timeout).
+                // If we returned from a previous Content session, ask server whether
+                // the game is still active. Server replies with headset_game_backend_command
+                // if active, silent otherwise.
                 if (pendingCheckReconnect) {
+                    pendingCheckReconnect = false;
                     sendCheckReconnect();
                 }
             }
@@ -550,11 +554,6 @@ public class MainActivity extends Activity {
         Log.d(TAG, "headset_game_backend_command: " + command);
 
         if ("connect".equals(command)) {
-            // Server has authoritatively confirmed this session → cancel the check-reconnect
-            // timeout and clear the pending flag so it can't later clear our now-valid state.
-            mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
-            pendingCheckReconnect = false;
-
             JSONObject connectData = json.optJSONObject("connectData");
             if (connectData == null) {
                 Log.e(TAG, "connect command missing connectData");
@@ -616,13 +615,9 @@ public class MainActivity extends Activity {
             launchContent(pkg, extras);
         } else if ("disconnect".equals(command)) {
             Log.d(TAG, "Disconnect command received — stopping Content");
-            // Clear the "should be running" flag AND the session-confirmed flag so neither the
-            // watchdog nor a later onResume treats the old session as still valid.
-            mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
-            pendingCheckReconnect = false;
+            // Clear the "should be running" flag so we don't auto re-launch Content
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
-                .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false)
                 .apply();
             stopContent();
         }
@@ -645,29 +640,47 @@ public class MainActivity extends Activity {
 
         // Persist launch state so Lobby can:
         //  (a) skip reconnecting WebSocket while Content owns the clientId (grace period)
-        //  (b) let the watchdog hold Content in front (content_session_confirmed=true — this is
-        //      the ONLY place that sets it, i.e. only a server connect command confirms a session)
-        // launchContent() is reached ONLY from the server "connect" command handler.
+        //  (b) auto re-launch Content if Lobby restarts while Content was supposed to be running
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putLong(PREF_CONTENT_LAUNCHED_AT, System.currentTimeMillis())
             .putBoolean(PREF_CONTENT_SHOULD_RUN, true)
-            .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, true)
             .putString(PREF_CONTENT_PACKAGE, pkg)
             .putString(PREF_CONTENT_EXTRAS_JSON, extras != null ? extras.toString() : "{}")
             .apply();
 
-        // Force-disconnect WebSocket BEFORE launching Content.
-        // Content uses the same clientId — server must release the old session
-        // first or Content's connection will hang in "connecting" state.
+        // Diagnostics: everything needed to debug the "1st jump fails, 2nd succeeds" clientId issue.
+        Log.d(TAG, "launchContent DIAG"
+                + " | LobbyClientId=" + getClientId()
+                + " | contentPackage=" + pkg
+                + " | Websocket=" + (extras != null ? extras.optString("Websocket") : "")
+                + " | cmdLine=" + (extras != null ? extras.optString("cmdLine") : "")
+                + " | serverip=" + (extras != null ? extras.optString("serverip") : "")
+                + " | wsserverip=" + (extras != null ? extras.optString("wsserverip") : "")
+                + " | wsport=" + (extras != null ? extras.optString("wsport") : "")
+                + " | roomId=" + (extras != null ? extras.optString("roomId") : "")
+                + " | mapName=" + (extras != null ? extras.optString("mapName") : "")
+                + " | launchDelayMs=" + LAUNCH_DELAY_AFTER_DISCONNECT_MS);
+
+        // Force-disconnect WebSocket BEFORE launching Content. Content reuses the SAME clientId
+        // (device IPv4), so the server must fully release the Lobby's session first — otherwise
+        // Content's connect is rejected as a duplicate clientId and only the 2nd jump succeeds
+        // (once the stale Lobby session finally times out server-side).
+        //
+        // Use a GRACEFUL close() only — do NOT cancel() immediately afterwards. cancel() aborts
+        // the TCP connection before the close frame is flushed, so the server never runs its
+        // onClose handler and never frees the clientId. close(1000) sends the close frame, the
+        // server releases the clientId, and the delay below covers propagation.
         if (webSocket != null) {
             WebSocket ws = webSocket;
             webSocket = null;                            // null FIRST so late callbacks are stale
             socketState = SocketState.DISCONNECTED;
             connectedSocketIpv4 = null;
-            ws.close(1000, "Launching Content");         // polite close frame
-            ws.cancel();                                 // immediate TCP teardown
-            Log.d(TAG, "WebSocket force-disconnected, waiting " + LAUNCH_DELAY_AFTER_DISCONNECT_MS
+            boolean closing = ws.close(1000, "Launching Content");   // graceful close, NO cancel()
+            Log.d(TAG, "WebSocket graceful close initiated=" + closing + " @" + System.currentTimeMillis()
+                    + ", waiting " + LAUNCH_DELAY_AFTER_DISCONNECT_MS
                     + "ms before launch (let server release clientId)");
+        } else {
+            Log.d(TAG, "No active Lobby WebSocket to close before launch");
         }
 
         // Delay so server has time to:
@@ -695,12 +708,48 @@ public class MainActivity extends Activity {
                 }
 
                 startActivity(intent);
-                Log.d(TAG, "Application launch successfully: " + pkg);
+                Log.d(TAG, "Application launch successfully: " + pkg + " @" + System.currentTimeMillis()
+                        + " (clientId released " + LAUNCH_DELAY_AFTER_DISCONNECT_MS + "ms earlier)");
             } catch (Exception e) {
                 Log.e(TAG, "Failed to launch " + pkg + ": " + e.getMessage());
                 contentLaunched = false;
             }
         }, LAUNCH_DELAY_AFTER_DISCONNECT_MS);
+    }
+
+    private void relaunchContent(String pkg, JSONObject extras) {
+        // Lighter version of launchContent for auto-relaunch after Lobby restart.
+        // Skips WebSocket disconnect (Lobby may not even be connected yet) and skips
+        // updating SharedPreferences (the original state is still valid).
+        if (!isAppInstalled(pkg)) {
+            Log.e(TAG, "Auto re-launch: " + pkg + " not installed, clearing flag");
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
+                .apply();
+            return;
+        }
+        contentLaunched = true;
+        currentContentPackage = pkg;
+        try {
+            PackageManager pm = getPackageManager();
+            Intent intent = pm.getLaunchIntentForPackage(pkg);
+            if (intent == null) {
+                Log.e(TAG, "Auto re-launch: no launch intent for " + pkg);
+                contentLaunched = false;
+                return;
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            Iterator<String> keys = extras.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                intent.putExtra(key, extras.optString(key));
+            }
+            startActivity(intent);
+            Log.d(TAG, "Auto re-launch successful: " + pkg);
+        } catch (Exception e) {
+            Log.e(TAG, "Auto re-launch failed: " + e.getMessage());
+            contentLaunched = false;
+        }
     }
 
     private void stopContent() {
@@ -740,46 +789,9 @@ public class MainActivity extends Activity {
             json.put("headsetId", getClientId());
             webSocket.send(json.toString());
             Log.d(TAG, "Sent headset_check_reconnect: " + json);
-            // Arm the server-response timeout. If no connect command arrives within
-            // CHECK_RECONNECT_TIMEOUT_MS, the runnable clears the stale state and we stay in Lobby.
-            mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
-            mainHandler.postDelayed(checkReconnectTimeoutRunnable, CHECK_RECONNECT_TIMEOUT_MS);
         } catch (Exception e) {
             Log.e(TAG, "headset_check_reconnect send failed: " + e.getMessage());
         }
-    }
-
-    /**
-     * Fired when the server does not answer headset_check_reconnect with a connect command in time.
-     * Server silence means "no active game" → drop the stale Content session and stay in the Lobby.
-     */
-    private final Runnable checkReconnectTimeoutRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (pendingCheckReconnect) {
-                Log.d(TAG, "headset_check_reconnect timeout — server did not confirm; staying in Lobby");
-                clearContentRuntimeState("check-reconnect-timeout");
-            }
-        }
-    };
-
-    /**
-     * Forget any locally-remembered Content session. After this, KioskService sees
-     * content_should_run=false / content_session_confirmed=false and keeps the Lobby in front;
-     * nothing relaunches Content until a fresh server connect command arrives.
-     */
-    private void clearContentRuntimeState(String reason) {
-        Log.d(TAG, "Clearing Content runtime state: " + reason);
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
-                .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false)
-                .remove(PREF_CONTENT_PACKAGE)
-                .remove(PREF_CONTENT_EXTRAS_JSON)
-                .remove(PREF_CONTENT_LAUNCHED_AT)
-                .apply();
-        contentLaunched = false;
-        currentContentPackage = DEFAULT_CONTENT_PACKAGE;
-        pendingCheckReconnect = false;
     }
 
     private boolean isAppInstalled(String pkg) {
