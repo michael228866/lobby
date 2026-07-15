@@ -661,6 +661,11 @@ public class MainActivity extends Activity {
                 + " | mapName=" + (extras != null ? extras.optString("mapName") : "")
                 + " | launchDelayMs=" + LAUNCH_DELAY_AFTER_DISCONNECT_MS);
 
+        // Debug: launch target / delay / full extras JSON before the delayed startActivity.
+        Log.d(TAG, "Launch target package: " + pkg);
+        Log.d(TAG, "Launch delay ms: " + LAUNCH_DELAY_AFTER_DISCONNECT_MS);
+        Log.d(TAG, "Launch extras json: " + (extras != null ? extras.toString() : "null"));
+
         // Force-disconnect WebSocket BEFORE launching Content. Content reuses the SAME clientId
         // (device IPv4), so the server must fully release the Lobby's session first — otherwise
         // Content's connect is rejected as a duplicate clientId and only the 2nd jump succeeds
@@ -707,9 +712,26 @@ public class MainActivity extends Activity {
                     }
                 }
 
+                // Debug: dump the ACTUAL extras attached to the Intent Content will receive.
+                Bundle debugExtras = intent.getExtras();
+                if (debugExtras != null) {
+                    for (String key : debugExtras.keySet()) {
+                        Log.d(TAG, "Intent extra to Content: " + key + "=" + debugExtras.get(key));
+                    }
+                } else {
+                    Log.w(TAG, "Intent extras to Content are null");
+                }
+
                 startActivity(intent);
                 Log.d(TAG, "Application launch successfully: " + pkg + " @" + System.currentTimeMillis()
                         + " (clientId released " + LAUNCH_DELAY_AFTER_DISCONNECT_MS + "ms earlier)");
+
+                // Debug: confirm Content's process actually came up (helps diagnose the
+                // "dead after ~1 minute" report — did it ever exist?). Check at +3s and +10s.
+                mainHandler.postDelayed(() ->
+                        Log.d(TAG, "Content process alive after launch (+3s)? " + isContentProcessAlive(pkg)), 3000);
+                mainHandler.postDelayed(() ->
+                        Log.d(TAG, "Content process alive after launch (+10s)? " + isContentProcessAlive(pkg)), 10000);
             } catch (Exception e) {
                 Log.e(TAG, "Failed to launch " + pkg + ": " + e.getMessage());
                 contentLaunched = false;
