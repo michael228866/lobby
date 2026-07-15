@@ -11,16 +11,19 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.provider.Settings;
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -102,6 +105,8 @@ public class MainActivity extends Activity {
     private Handler mainHandler;
     private boolean contentLaunched = false;
     private boolean pendingCheckReconnect = false;
+    private boolean usageStatsSettingsRequested = false;
+    private boolean storageSettingsRequested = false;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
 
@@ -157,18 +162,6 @@ public class MainActivity extends Activity {
         // the server. It is set true again only when a server connect command launches Content.
         savedPrefs.edit().putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false).apply();
 
-        if (hasUsageStatsPermission()) {
-            Log.d(TAG, "Kiosk mode: PACKAGE_USAGE_STATS granted ✓");
-        } else {
-            Log.w(TAG, "Kiosk mode: PACKAGE_USAGE_STATS NOT granted. Run: adb shell appops set " + getPackageName() + " GET_USAGE_STATS allow");
-        }
-
-        if (Environment.isExternalStorageManager()) {
-            Log.d(TAG, "Storage: MANAGE_EXTERNAL_STORAGE granted ✓ (can read /sdcard/Pictures/...)");
-        } else {
-            Log.w(TAG, "Storage: MANAGE_EXTERNAL_STORAGE NOT granted. Run: adb shell appops set --uid " + getPackageName() + " MANAGE_EXTERNAL_STORAGE allow");
-        }
-
         enableLockTaskWhitelist();
 
         serverUrl = buildServerUrl();
@@ -183,6 +176,17 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+
+        if (!hasUsageStatsPermission() && !usageStatsSettingsRequested) {
+            usageStatsSettingsRequested = true;
+            checkAndRequestUsageStats();
+            return;
+        }
+        if (!hasAllFilesAccess() && !storageSettingsRequested) {
+            storageSettingsRequested = true;
+            checkAndRequestStoragePermission();
+            return;
+        }
 
         startKioskLockTask();
 
@@ -573,7 +577,11 @@ public class MainActivity extends Activity {
             // Content derives its own identity (device IPv4, formerly the SN) independently —
             // same device → same IPv4 → same clientId as the Lobby. Passing an extra -clientId
             // flag deviates from the UE format and can crash Content's command-line parsing.
-            String cmdLine = "-serverip=" + gameIp + ":" + gamePort
+            String[] packageParts = pkg.split("\\.");
+            String projectName = packageParts[packageParts.length - 1];
+            String cmdLine = "-project=\"../../../" + projectName + "/"
+                    + projectName + ".uproject\""
+                    + " -serverip=" + gameIp + ":" + gamePort
                     + " -wsserverip=" + SERVER_HOST
                     + " -wsport=" + SERVER_PORT
                     + " -roomId=" + connectRoomId
@@ -588,7 +596,8 @@ public class MainActivity extends Activity {
             JSONObject extras = new JSONObject();
             try {
                 extras.put("Websocket", cmdLine);   // ★ THE KEY OLD UE USES
-                extras.put("cmdLine", cmdLine);      // also pass under standard UE name (fallback)
+                extras.put("CommandLine", cmdLine);  // Unreal Engine Android parser (case-sensitive)
+                extras.put("cmdLine", cmdLine);      // backward compatibility
                 extras.put("userId", "12345");
                 extras.put("fromApp", "hellLobby");
                 // Individual fields kept for non-UE apps that may want them separately
@@ -1030,10 +1039,32 @@ public class MainActivity extends Activity {
 
     private boolean hasUsageStatsPermission() {
         AppOpsManager appOps = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
-        int mode = appOps.unsafeCheckOpNoThrow(
+        int mode = appOps.checkOpNoThrow(
                 AppOpsManager.OPSTR_GET_USAGE_STATS,
                 Process.myUid(),
                 getPackageName());
         return mode == AppOpsManager.MODE_ALLOWED;
+    }
+
+    private void checkAndRequestUsageStats() {
+        if (!hasUsageStatsPermission()) {
+            Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        }
+    }
+
+    private boolean hasAllFilesAccess() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R
+                || Environment.isExternalStorageManager();
+    }
+
+    private void checkAndRequestStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !hasAllFilesAccess()) {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        }
     }
 }
