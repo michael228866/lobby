@@ -711,7 +711,9 @@ public class MainActivity extends Activity {
                     contentLaunched = false;
                     return;
                 }
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                // A previous Unreal process may still own a GameActivity with immutable startup
+                // arguments. Recreate its task so this server launch consumes the new extras.
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
 
                 if (extras != null) {
                     Iterator<String> keys = extras.keys();
