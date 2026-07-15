@@ -577,11 +577,7 @@ public class MainActivity extends Activity {
             // Content derives its own identity (device IPv4, formerly the SN) independently —
             // same device → same IPv4 → same clientId as the Lobby. Passing an extra -clientId
             // flag deviates from the UE format and can crash Content's command-line parsing.
-            String[] packageParts = pkg.split("\\.");
-            String projectName = packageParts[packageParts.length - 1];
-            String cmdLine = "-project=\"../../../" + projectName + "/"
-                    + projectName + ".uproject\""
-                    + " -serverip=" + gameIp + ":" + gamePort
+            String cmdLine = "-serverip=" + gameIp + ":" + gamePort
                     + " -wsserverip=" + SERVER_HOST
                     + " -wsport=" + SERVER_PORT
                     + " -roomId=" + connectRoomId
