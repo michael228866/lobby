@@ -256,7 +256,7 @@ public class KioskService extends Service {
 
     /**
      * Re-attach the original Content Intent extras persisted by MainActivity.launchContent().
-     * All values were stored as Strings (Websocket / cmdLine / userId / fromApp / serverip /
+     * All values were stored as Strings (Websocket / cmdline / cmdLine / userId / fromApp / serverip /
      * wsserverip / wsport / roomId / useMultiVRGis / mapName / ip / port / playerheight), so we
      * re-put them as Strings to keep Content's command-line parsing identical to the first launch.
      *
