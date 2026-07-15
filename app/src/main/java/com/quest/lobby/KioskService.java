@@ -120,11 +120,12 @@ public class KioskService extends Service {
 
         SharedPreferences prefs = getSharedPreferences("lobby_state", MODE_PRIVATE);
         boolean shouldRun = prefs.getBoolean("content_should_run", false);
+        boolean sessionConfirmed = prefs.getBoolean("content_session_confirmed", false);
         String contentPkg = prefs.getString("content_package", MainActivity.DEFAULT_CONTENT_PACKAGE);
 
         MainActivity.Foreground immediateFgEvent = MainActivity.queryForeground(this);
         String immediateFg = immediateFgEvent == null ? null : immediateFgEvent.pkg;
-        if (shouldRun && immediateFg != null
+        if (shouldRun && sessionConfirmed && immediateFg != null
                 && !immediateFg.equals(getPackageName())
                 && !immediateFg.equals(contentPkg)) {
             long now = System.currentTimeMillis();
@@ -159,7 +160,6 @@ public class KioskService extends Service {
         // force-stopped / not started yet), KioskService does NOT launch it — it brings the Lobby
         // forward and lets MainActivity.onResume() ask the server (headset_check_reconnect) whether
         // Content should be (re)started. Only a server connect command may launch Content.
-        boolean sessionConfirmed = prefs.getBoolean("content_session_confirmed", false);
         boolean contentAlive = shouldRun && isAliveCached(contentPkg);
         boolean contentIsTarget = shouldRun && sessionConfirmed && contentAlive;
         String target = contentIsTarget ? contentPkg : getPackageName();
