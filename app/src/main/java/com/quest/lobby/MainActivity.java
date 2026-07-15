@@ -63,6 +63,7 @@ public class MainActivity extends Activity {
     private String cachedClientId;
 
     private static final long RECONNECT_DELAY_MS = 3000;
+    private static boolean processInitialized = false;
 
     static {
         System.loadLibrary("lobby_vr");
@@ -84,7 +85,7 @@ public class MainActivity extends Activity {
     private static final String PREF_CONTENT_PACKAGE = "content_package";
     private static final String PREF_CONTENT_EXTRAS_JSON = "content_extras_json";
     // Set true ONLY after the server confirms this run's session (connect command → launchContent).
-    // Reset on disconnect, on check-reconnect timeout, and on a fresh Activity/process start.
+    // Reset on disconnect, on check-reconnect timeout, and once on a fresh process start.
     // KioskService will only hold Content in the foreground while this is true — so a stale
     // content_should_run=true from a previous run can never make the watchdog jump to Content
     // before the server has re-confirmed. Shared literal key with KioskService.
@@ -157,10 +158,12 @@ public class MainActivity extends Activity {
             Log.d(TAG, "Restored currentContentPackage from prefs: " + savedPkg);
         }
 
-        // Fresh process/Activity start: the session is NOT server-confirmed yet. Force the flag
-        // false so the watchdog won't hold a stale Content in front before onResume has re-asked
-        // the server. It is set true again only when a server connect command launches Content.
-        savedPrefs.edit().putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false).apply();
+        // Clear stale confirmation once per process, not on every Activity recreation. Content
+        // remains server-confirmed when Android recreates Lobby while the game is still active.
+        if (!processInitialized) {
+            processInitialized = true;
+            savedPrefs.edit().putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false).apply();
+        }
 
         enableLockTaskWhitelist();
 
