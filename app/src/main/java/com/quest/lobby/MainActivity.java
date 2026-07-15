@@ -667,21 +667,22 @@ public class MainActivity extends Activity {
         Log.d(TAG, "Launch extras json: " + (extras != null ? extras.toString() : "null"));
 
         // Force-disconnect WebSocket BEFORE launching Content. Content reuses the SAME clientId
-        // (device IPv4), so the server must fully release the Lobby's session first — otherwise
-        // Content's connect is rejected as a duplicate clientId and only the 2nd jump succeeds
-        // (once the stale Lobby session finally times out server-side).
+        // (device IPv4), so the server MUST see the Lobby disconnect and free that clientId first,
+        // otherwise Content's connect (same clientId) is rejected as a duplicate and never connects.
         //
-        // Use a GRACEFUL close() only — do NOT cancel() immediately afterwards. cancel() aborts
-        // the TCP connection before the close frame is flushed, so the server never runs its
-        // onClose handler and never frees the clientId. close(1000) sends the close frame, the
-        // server releases the clientId, and the delay below covers propagation.
+        // We do close(1000) AND cancel(): close() sends the polite close frame, cancel() then
+        // forcibly tears down the TCP (RST). The cancel() is essential — fiveg-local does not
+        // reliably echo a close frame, so a graceful-only close() can leave the TCP ESTABLISHED,
+        // the server keeps thinking the Lobby clientId is connected, and Content can never connect.
+        // The delay below then gives the server time to run its onClose and free the clientId.
         if (webSocket != null) {
             WebSocket ws = webSocket;
             webSocket = null;                            // null FIRST so late callbacks are stale
             socketState = SocketState.DISCONNECTED;
             connectedSocketIpv4 = null;
-            boolean closing = ws.close(1000, "Launching Content");   // graceful close, NO cancel()
-            Log.d(TAG, "WebSocket graceful close initiated=" + closing + " @" + System.currentTimeMillis()
+            boolean closing = ws.close(1000, "Launching Content");   // polite close frame
+            ws.cancel();                                             // force TCP teardown (RST)
+            Log.d(TAG, "WebSocket close(initiated=" + closing + ")+cancel @" + System.currentTimeMillis()
                     + ", waiting " + LAUNCH_DELAY_AFTER_DISCONNECT_MS
                     + "ms before launch (let server release clientId)");
         } else {
