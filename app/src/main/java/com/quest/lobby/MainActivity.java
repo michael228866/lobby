@@ -592,8 +592,6 @@ public class MainActivity extends Activity {
             JSONObject extras = new JSONObject();
             try {
                 extras.put("Websocket", cmdLine);   // ★ THE KEY OLD UE USES
-                extras.put("CommandLine", cmdLine);  // compatibility with alternate UE builds
-                extras.put("cmdLine", cmdLine);      // compatibility with previous Lobby builds
                 extras.put("cmdline", cmdLine);      // this UE GameActivity / old Lobby (case-sensitive)
                 extras.put("userId", "12345");
                 extras.put("fromApp", "hellLobby");
@@ -663,7 +661,6 @@ public class MainActivity extends Activity {
                 + " | contentPackage=" + pkg
                 + " | Websocket=" + (extras != null ? extras.optString("Websocket") : "")
                 + " | cmdline=" + (extras != null ? extras.optString("cmdline") : "")
-                + " | cmdLine=" + (extras != null ? extras.optString("cmdLine") : "")
                 + " | serverip=" + (extras != null ? extras.optString("serverip") : "")
                 + " | wsserverip=" + (extras != null ? extras.optString("wsserverip") : "")
                 + " | wsport=" + (extras != null ? extras.optString("wsport") : "")
