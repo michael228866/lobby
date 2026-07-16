@@ -1,315 +1,333 @@
-# Lobby (com.quest.lobby) — 運作說明
+# Lobby (`com.quest.lobby`)
 
-Meta Quest 上的 **Kiosk 模式 Lobby App**，負責待命、接收伺服器指令、啟動指定的 Content (VR 遊戲)。
-
-## 一句話描述
-
-Lobby 連著 fiveg-local WebSocket server，**operator 從 dashboard 按啟動 → Lobby 收到指令 → 啟動 HellVR (或其他 Content)**。遊戲關掉或被切走時，**自動把 Content 拉回前景，使用者無法逃離**。
-
----
+Meta Quest VR Kiosk Lobby。Lobby 連接 `fiveg-local` WebSocket Server，接收 Operator 的遊戲啟動／關閉命令，並透過 Android Intent 啟動 Unreal Engine Content APK。
 
 ## 系統架構
 
-```
- Cloud REST API (Google Cloud Run)
-       ↑
-       │
- Operator Dashboard (fiveg-operator, 瀏覽器)
-       ↕  WebSocket
- fiveg-local Server (內網 192.168.99.200:5000)
-       ↕  WebSocket          ↑ Game Backend 連這裡
- Lobby (這個 app, com.quest.lobby)
-       ↓  Intent (跨 app 啟動)
- Content / HellVR (com.moondream.HellVR)
-```
-
----
-
-## 完整流程
-
-### 1. 開機自啟
-1. Quest 開機完成
-2. `BootReceiver` 收到 `BOOT_COMPLETED` broadcast
-3. 等 5 秒讓系統穩定
-4. 啟動 `MainActivity`
-
-> ⚠️ Lobby 必須先**手動啟動過一次**，`BOOT_COMPLETED` 才會送到（Android 安全機制）。
-
-### 2. 連線 fiveg-local
-1. 讀取 ClientID（優先序）：
-   - `/sdcard/Pictures/moonshineslam/ClientID.txt`（自訂）
-   - `/sdcard/Pictures/moonshineslam/HMDSN.jpg`（SN，如 `340YC20G8C0J4Y`）
-   - 裝置 IPv4
-   - 隨機 UUID（fallback）
-2. 連 `ws://192.168.99.200:5000/?type=vr_headset&clientId=XXX&roomId=1234`
-3. 收到 `welcome` 後就待命
-
-### 3. 啟動 Content (operator 按啟動)
-1. Server 送 `headset_game_backend_command + connect` 給 Lobby，含 `connectData`：
-   ```json
-   {
-     "roomId": "20260514-M002",
-     "ip": "192.168.99.203",
-     "port": 10000,
-     "packageName": "com.moondream.HellVR",
-     "mapName": "openday"
-   }
-   ```
-2. Lobby 組 cmdLine：
-   ```
-   -serverip=192.168.99.203:10000 -wsserverip=192.168.99.200 -wsport=5000
-   -roomId=20260514-M002 -useMultiVRGis=true -mapName=openday
-   ```
-3. 強制斷開自己的 WebSocket（讓 server 釋放 clientId 給 Content 用）
-4. 等 300ms
-5. `startActivity` 啟動 Content APK，傳 cmdLine 等 extras 進去
-6. SharedPreferences 存狀態：`content_should_run=true`、`content_package`、`content_extras_json`
-7. Lobby 進背景，Content 跑起來
-
-### 4. Kiosk 監控
-Watchdog 由 **`KioskService`（前景 service）**負責，在 `onCreate` 啟動、每 100ms 檢查一次（獨立於 Activity 生命週期，避免背景 Handler 被限流）。`MainActivity` 本身**不再跑任何 watchdog**，確保只有一個 watchdog owner，不會重複 `startActivity`／閃爍。
-
-判斷邏輯（Content 的啟動權**只屬於 server**）：
-
-```
-target 決定：
-  content_should_run == true 且 content_session_confirmed == true 且 Content alive → target = Content
-  其餘所有情況（未確認 / Content 死了 / should_run=false）                        → target = Lobby
-
-前景 == target？或偵測不到前景？ → 不動
-其他 app 搶前景（Meta Menu / Quest Home / 其他）→ 每個前景事件只處理一次：
-  ├─ target = Content
-  │   └─ ✅ REORDER_TO_FRONT 把 Content 拉回前景（不補 extras、不重建 Content）
-  └─ target = Lobby
-      └─ REORDER_TO_FRONT 把 Lobby 拉回前景
+```text
+Operator Dashboard
+        |
+        | WebSocket command
+        v
+fiveg-local Server (192.168.99.200:5000)
+        |
+        | WebSocket
+        v
+Lobby (com.quest.lobby)
+        |
+        | Android Intent + extras
+        v
+Content / HellVR (例如 com.moondream.HellVR)
 ```
 
-`content_session_confirmed`（session 是否經 server 確認）：
+主要元件：
 
-```
-server connect command → launchContent()  → true
-server disconnect                          → false
-headset_check_reconnect 8 秒 timeout       → false
-fresh app / Activity 啟動（onCreate）       → false
-```
+- [`MainActivity.java`](app/src/main/java/com/quest/lobby/MainActivity.java)：WebSocket、遊戲啟動、session 狀態及 OpenXR Lobby。
+- [`KioskService.java`](app/src/main/java/com/quest/lobby/KioskService.java)：100ms 前景監控與 Meta Menu 拉回。
+- [`BootReceiver.java`](app/src/main/java/com/quest/lobby/BootReceiver.java)：開機 5 秒後啟動 Lobby。
+- [`FileLogger.java`](app/src/main/java/com/quest/lobby/FileLogger.java)：將 Lobby log 寫入頭盔儲存空間。
+- [`install-quest.bat`](install-quest.bat)：安裝 APK 並設定每台 Quest 所需的 AppOps。
 
-**重要**：
-- `KioskService` **絕對不 launch Content**。Content 死掉／被 force-stop／crash 時，它把 Lobby 拉回前景，由 `MainActivity.onResume()` 問 server，**只有 server 回 `connect` 才會啟動 Content**。
-- 就算 SharedPreferences 殘留舊的 `content_should_run=true`，因為 `content_session_confirmed` 在 `onCreate` 被重設為 false，watchdog 也不會把（可能還活著的）舊 Content 拉回前景，保證停在 Lobby。
+## 啟動流程
 
-### 5. Lobby 重新出現時（server 擁有啟動權）
-`onResume` 觸發後 **不做任何本地 relaunch**，一律問 server：
+### Lobby 啟動
 
-```
-should_run == true 且在 1 小時內？
-├─ 否 → 正常連 WS 待命
-└─ 是 →（不管 Content alive 或 dead）
-    ├─ pendingCheckReconnect = true
-    ├─ 連 WS → onOpen → sendCheckReconnect()（送 headset_check_reconnect）
-    ├─ 同時啟動 8 秒 timeout
-    ├─ Server 回 connect  → 取消 timeout、launchContent()（session_confirmed=true）
-    └─ Server 8 秒沒回     → clearContentRuntimeState()：
-                             content_should_run=false、content_session_confirmed=false、
-                             清掉 package/extras/launched_at → 停在 Lobby
+1. `BootReceiver` 收到 `BOOT_COMPLETED`，等待 5 秒後啟動 `MainActivity`。
+2. Lobby 以裝置 IPv4 作為 `clientId`；網路尚未就緒時暫時使用隨機 UUID，取得 IPv4 後重建連線 URL。
+3. Lobby 連線：
+
+```text
+ws://192.168.99.200:5000/?type=vr_headset&clientId=<IPv4>&roomId=1234
 ```
 
-> ⚠️ 舊版的「Content process 活著就本地 `relaunchContent()`（FAST PATH）」已**移除**。本地 SharedPreferences 或 process alive 都**不能**啟動 Content——啟動權只屬於 server。
+4. `KioskService` 以前景服務啟動，獨立於 Activity lifecycle 執行 watchdog。
 
-### 6. 結束遊戲
-**Operator 按 dashboard 的 disconnect 按鈕**：
-1. Server 送 `headset_game_backend_command + disconnect` 給 Lobby
-2. Lobby 清掉 `content_should_run` 與 `content_session_confirmed` 旗標
-3. Lobby 送 `game_closed` 回 server（規格要求）
-4. 拉 Lobby 回前景，等下次啟動
+### Server 啟動 Content
 
----
+Server 傳入：
 
-## 主要程式碼位置
+```json
+{
+  "type": "headset_game_backend_command",
+  "command": "connect",
+  "connectData": {
+    "roomId": "20260713-M001",
+    "ip": "192.168.99.203",
+    "port": 10000,
+    "packageName": "com.moondream.HellVR",
+    "mapName": "M5"
+  }
+}
+```
 
-| 功能 | 檔案 |
-|------|------|
-| 主邏輯 | [app/src/main/java/com/quest/lobby/MainActivity.java](app/src/main/java/com/quest/lobby/MainActivity.java) |
-| 開機 receiver | [app/src/main/java/com/quest/lobby/BootReceiver.java](app/src/main/java/com/quest/lobby/BootReceiver.java) |
-| 檔案 log | [app/src/main/java/com/quest/lobby/FileLogger.java](app/src/main/java/com/quest/lobby/FileLogger.java) |
-| OpenXR 場景 | [app/src/main/cpp/main.cpp](app/src/main/cpp/main.cpp) |
-| Manifest | [app/src/main/AndroidManifest.xml](app/src/main/AndroidManifest.xml) |
+Lobby 組成 Unreal command line：
 
-### MainActivity 內的關鍵函式
+```text
+-serverip=192.168.99.203:10000 -wsserverip=192.168.99.200 -wsport=5000 -roomId=20260713-M001 -useMultiVRGis=true -mapName=M5
+```
 
-| 函式 | 用途 |
-|------|------|
-| `onCreate` | 初始化、還原 SharedPrefs 狀態、連 WebSocket |
-| `onResume` | 回前景時：should_run=true 就設 `pendingCheckReconnect` 問 server（**不本地 relaunch**） |
-| `onPause` | 進背景（watchdog 由 `KioskService` 負責，這裡不做事） |
-| `registerNetworkCallback` | 監聽 Wi-Fi／網段切換，觸發 WebSocket 遷移 |
-| `handleNetworkChanged` / `reconnectForNewIpv4` | IPv4 改變時完整重建 WebSocket（換新 clientId） |
-| `connectWebSocket` | 連 fiveg-local，註冊收訊息 listener（含 stale-socket 保護） |
-| `handleMessage` | 分派 server 訊息到對應 handler |
-| `handleGameBackendCommand` | 處理 `connect`（→ `launchContent`）/ `disconnect` 指令 |
-| `launchContent` | 啟動 Content app（**只由 server connect 呼叫**；寫 SharedPrefs 並設 `content_session_confirmed=true`） |
-| `sendCheckReconnect` | 送 `headset_check_reconnect` 問 server 房間是否還在，並啟動 8 秒 timeout |
-| `checkReconnectTimeoutRunnable` | server 8 秒沒回 connect → `clearContentRuntimeState` 停在 Lobby |
-| `clearContentRuntimeState` | 清掉本地 Content session（should_run / session_confirmed / package / extras / launched_at） |
-| `getForegroundPackage` / `queryForeground` | 用 `UsageStatsManager` 查當前前景 app（`KioskService` 共用） |
-| `isContentProcessAlive` | 用 `pidof` + `ps` 雙重檢查 Content 是否存活 |
-| `getClientId` / `getDeviceIpv4` | 以裝置 IPv4 當 ClientID |
+重要：目前這個 Unreal `GameActivity` 使用大小寫敏感的全小寫 Intent Extra key：
 
-> Watchdog 邏輯已移至 [`KioskService.java`](app/src/main/java/com/quest/lobby/KioskService.java)（`doCheck` / `bringContentToFront`）。`MainActivity` 舊有的 `kioskCheck` / `startKioskWatchdog` / `isContentRunning` / `relaunchContent`（本地 fast-path relaunch）已移除——Content 啟動權只屬於 server。
+```java
+extras.put("cmdline", cmdLine);
+```
 
----
+不要改成 `CommandLine` 或 `cmdLine`。如果 key 不正確，Unreal 讀不到自訂參數，會保留 APK 預設的：
 
-## 設定 / 常數
+```text
+-project="../../../HellVR/HellVR.uproject"
+```
 
-[MainActivity.java](app/src/main/java/com/quest/lobby/MainActivity.java) 開頭：
+Lobby 另外保留 `Websocket` 及個別欄位，供舊版 Blueprint／非 UE Content 使用：
 
-| 常數 | 預設值 | 說明 |
-|------|--------|------|
-| `SERVER_HOST` | `192.168.99.200` | fiveg-local server IP |
-| `SERVER_PORT` | `5000` | fiveg-local port |
-| `CLIENT_TYPE` | `vr_headset` | 連線類型 |
-| `DEFAULT_ROOM_ID` | `1234` | 初始 roomId（連上後 server 會給真實值） |
-| `RECONNECT_DELAY_MS` | `3000` | WS 失敗後重連等待時間 |
-| `KIOSK_LAUNCH_GRACE_MS` | `8000` | 啟動 Content 後不干預的時間 |
-| `CHECK_RECONNECT_TIMEOUT_MS` | `8000` | 送出 `headset_check_reconnect` 後等 server 回 connect 的上限；逾時清狀態停 Lobby |
-| `LAUNCH_DELAY_AFTER_DISCONNECT_MS` | `3000` | 斷 WS 後等多久才啟動 Content |
-| `CONTENT_GRACE_PERIOD_MS` | `60000` | Lobby 不重連 WS 的緩衝期 |
-| `CONTENT_AUTO_RELAUNCH_WINDOW_MS` | `3600000` | should_run=true 後仍會問 server 是否 reconnect 的時效（1 小時） |
+```text
+Websocket, userId, fromApp, serverip, wsserverip, wsport, roomId,
+useMultiVRGis, mapName, ip, port, playerheight
+```
 
-[BootReceiver.java](app/src/main/java/com/quest/lobby/BootReceiver.java):
+正式啟動步驟：
 
-| 常數 | 預設值 |
-|------|--------|
-| `BOOT_DELAY_MS` | `5000` |
+1. 寫入 `content_should_run=true`、`content_session_confirmed=true`、Content package 及完整 extras。
+2. 關閉 Lobby WebSocket，釋放與 Content 共用的 `clientId`。
+3. 等待 `LAUNCH_DELAY_AFTER_DISCONNECT_MS`（目前 3000ms）。
+4. 使用 `NEW_TASK | CLEAR_TOP` 啟動 Content。
+5. Content 使用全小寫 `cmdline` 取得 server 參數並建立自己的連線。
 
----
+## Content session 狀態
 
-## WebSocket 協議
+SharedPreferences：`lobby_state`
 
-### Lobby 收的訊息
+| Key | 用途 |
+|---|---|
+| `content_should_run` | Server 是否仍預期遊戲運行 |
+| `content_session_confirmed` | 本次 process 是否已收到 Server 的 connect 確認 |
+| `content_package` | 目前 Content package |
+| `content_extras_json` | 原始啟動 extras，watchdog 拉回／重啟時重用 |
+| `content_launched_at` | 最近一次正式啟動時間 |
 
-| `type` | 處理 |
-|--------|------|
-| `welcome` | 連線成功 (忽略) |
-| `init_player_info` | 玩家資訊 (Content 用，Lobby 忽略) |
-| `headset_game_backend_command` + `command:"connect"` | 啟動 Content |
-| `headset_game_backend_command` + `command:"disconnect"` | 結束遊戲、Lobby 待命 |
-| `echo` / `ping` / `pong` | 忽略 |
+`content_session_confirmed` 的變化：
 
-### Lobby 送的訊息
+```text
+Server connect -> true
+Server disconnect -> false
+headset_check_reconnect timeout -> false
+新的 Lobby process 第一次建立 -> false
+同一 process 的 Activity recreation -> 保留原值
+```
 
-| `type` | 時機 |
-|--------|------|
-| `headset_check_reconnect` | Lobby 重新出現時，問 server 房間是否還活著 |
-| `game_closed` | Content 被 disconnect 指令關閉時 |
-| `{status: "content_launched"}` | 啟動 Content 前回報 |
-| `{status: "launch_failed_not_installed"}` | Content APK 沒裝 |
+每個 process 只在第一次 `onCreate()` 清除一次舊 confirmation。Android 重新建立同一個 Activity 時不會再把有效遊戲 session 清掉。
 
----
+## Watchdog / Meta Menu
 
-## 部署 (第一次安裝)
+`KioskService` 每 100ms 查詢最近的前景 App。它不能阻止 Meta Menu 本身出現，只能偵測後將正確 App 拉回前景。
 
-```bash
-# 編譯
-cd f:\game\lobby
+### 遊戲 session 已確認
+
+當以下條件成立：
+
+```text
+content_should_run=true
+content_session_confirmed=true
+前景 App 不是 Lobby，也不是 Content
+```
+
+watchdog 立即使用 `REORDER_TO_FRONT` 拉回 Content，不等待 Lobby WebSocket 或 3 秒正式啟動延遲。Intent 會重新帶上保存的 extras；如果 Android 已丟棄 Content task，也可用相同 `cmdline` 重建。
+
+這條快速路徑不依賴 `pidof`。Quest Android 14 可能禁止 Lobby 查詢其他 App PID，造成 `dead (no pid found)`，因此 PID 結果不能用來判定 Meta Menu 快速拉回。
+
+### Lobby 閒置
+
+如果 session 未確認或 `content_should_run=false`，Meta Menu 關閉後目標是 Lobby，不可啟動 Content。這可避免舊 SharedPreferences 讓 Lobby 閒置時誤跳 HellVR。
+
+### Content 被關閉或 crash
+
+- 若前景落到 Meta Menu 且 session 仍有效，watchdog 會直接嘗試用保存的 extras 啟動／拉回 Content。
+- 若前景回到 Lobby，Lobby 傳送 `headset_check_reconnect` 給 Server。
+- Server 若仍保留遊戲狀態，回傳新的 `connect`，Lobby 正式重啟 Content。
+- Server 8 秒內未確認，Lobby 清除 Content runtime state 並停留在 Lobby。
+
+## Server 關閉遊戲
+
+Server 傳入：
+
+```json
+{
+  "type": "headset_game_backend_command",
+  "command": "disconnect"
+}
+```
+
+Lobby 會：
+
+1. 將 `content_should_run` 與 `content_session_confirmed` 設為 `false`。
+2. 將 Lobby 拉回前景；Content 可能仍留在背景 process，但 watchdog 不會再拉回它。
+3. 傳送 `game_closed` 給 Server。
+
+## 必要權限
+
+Manifest 已宣告：
+
+- `PACKAGE_USAGE_STATS`：watchdog 讀取 Meta Menu／前景 App。
+- `MANAGE_EXTERNAL_STORAGE`：讀取外部自訂檔案時使用。
+- `READ_EXTERNAL_STORAGE`：舊版 Android 相容。
+- `RECEIVE_BOOT_COMPLETED`：開機啟動。
+- `FOREGROUND_SERVICE`／`FOREGROUND_SERVICE_SPECIAL_USE`：持續執行 KioskService。
+
+`PACKAGE_USAGE_STATS` 與 `MANAGE_EXTERNAL_STORAGE` 不能由一般 App 自行靜默核准；每台 Quest 都必須設定一次。若未授權：
+
+- Lobby 可能重複開啟系統設定頁。
+- Watchdog 無法得知 Meta Menu 在前景。
+
+查詢權限：
+
+```bat
+adb shell appops get com.quest.lobby GET_USAGE_STATS
+adb shell appops get com.quest.lobby MANAGE_EXTERNAL_STORAGE
+```
+
+正確結果應包含 `allow`。
+
+## Build 與安裝
+
+### Build
+
+```bat
 gradlew.bat assembleDebug
+```
 
-# 安裝
+預設 APK：
+
+```text
+app\build\outputs\apk\debug\app-debug.apk
+```
+
+### 建議：使用安裝腳本
+
+每次只連接一台已授權 USB debugging 的 Quest，執行：
+
+```bat
+install-quest.bat
+```
+
+腳本會：
+
+1. `adb install -r` 安裝 APK。
+2. 設定 `GET_USAGE_STATS=allow`。
+3. 設定 `MANAGE_EXTERNAL_STORAGE=allow`。
+4. force-stop 並重新啟動 Lobby。
+5. 顯示最後的 AppOps 狀態。
+
+也可以將其他 APK 拖到 `install-quest.bat` 上，或傳入路徑：
+
+```bat
+install-quest.bat path\to\lobby.apk
+```
+
+手動設定指令：
+
+```bat
 adb install -r app\build\outputs\apk\debug\app-debug.apk
-
-# 一次性授權
 adb shell appops set com.quest.lobby GET_USAGE_STATS allow
 adb shell appops set --uid com.quest.lobby MANAGE_EXTERNAL_STORAGE allow
-adb shell pm grant com.quest.lobby android.permission.READ_EXTERNAL_STORAGE
-
-# 啟動
 adb shell am force-stop com.quest.lobby
-adb shell monkey -p com.quest.lobby -c android.intent.category.LAUNCHER 1
+adb shell am start -n com.quest.lobby/.MainActivity
 ```
 
-### 為什麼需要這些授權
+## 設定值
 
-| 權限 | 用途 |
-|------|------|
-| `PACKAGE_USAGE_STATS` | Kiosk watchdog 偵測前景 app（沒授權 → 偵測不到 → 不會自動拉 Lobby/Content） |
-| `MANAGE_EXTERNAL_STORAGE` | 讀 `/sdcard/Pictures/moonshineslam/HMDSN.jpg` 取得 ClientID |
-| `READ_EXTERNAL_STORAGE` | 同上備援 |
-| `RECEIVE_BOOT_COMPLETED` | 開機自啟（manifest 宣告即可） |
+[`MainActivity.java`](app/src/main/java/com/quest/lobby/MainActivity.java)：
 
----
+| 常數 | 目前值 | 用途 |
+|---|---:|---|
+| `SERVER_HOST` | `192.168.99.200` | fiveg-local IP |
+| `SERVER_PORT` | `5000` | fiveg-local port |
+| `DEFAULT_ROOM_ID` | `1234` | 初始 room ID |
+| `RECONNECT_DELAY_MS` | `3000ms` | Lobby WebSocket 重試間隔 |
+| `KIOSK_LAUNCH_GRACE_MS` | `8000ms` | Content 啟動保護期 |
+| `CHECK_RECONNECT_TIMEOUT_MS` | `8000ms` | 等待 Server reconnect 確認 |
+| `LAUNCH_DELAY_AFTER_DISCONNECT_MS` | `3000ms` | 釋放 clientId 後正式啟動 Content 的等待時間 |
+| `CONTENT_GRACE_PERIOD_MS` | `60000ms` | Content 初始持有 clientId 的保護期 |
+| `CONTENT_AUTO_RELAUNCH_WINDOW_MS` | `3600000ms` | 保存 Content session 的最長回復窗口 |
 
-## Log / 除錯
+[`KioskService.java`](app/src/main/java/com/quest/lobby/KioskService.java)：
 
-### 自動寫檔位置
+| 常數 | 目前值 | 用途 |
+|---|---:|---|
+| `CHECK_INTERVAL_MS` | `100ms` | watchdog 輪詢間隔 |
+| `LAUNCH_GRACE_MS` | `8000ms` | 避免干擾 Content 啟動 |
+| `MIN_INTERVENTION_INTERVAL_MS` | `500ms` | 避免前景 App 互相閃爍 |
+
+## Log
+
+頭盔內：
+
+```text
+/sdcard/Android/data/com.quest.lobby/files/log.txt
+/sdcard/Android/data/com.quest.lobby/files/log.txt.1 ... log.txt.5
 ```
-/sdcard/Android/data/com.quest.lobby/files/log.txt          ← 目前正寫的
-/sdcard/Android/data/com.quest.lobby/files/log.txt.1 ~ .5   ← 過去的 (每份 5MB)
-```
 
-### 拉 log
-```bash
-adb pull "//sdcard/Android/data/com.quest.lobby/files/log.txt" .
-```
+每個檔案最多 5MB。
 
-### 即時看 log
-```bash
+讀取：
+
+```bat
+adb pull /sdcard/Android/data/com.quest.lobby/files/log.txt .
 adb logcat -s Lobby:V
 ```
 
-### 關鍵 log 訊息
+重要 log：
 
-| 訊息 | 意義 |
-|------|------|
-| `ClientID loaded from XXX: 340YC20G8C0J4Y` | ClientID 正常讀取 |
-| `WebSocket connected (as Lobby)` | 連上 server |
-| `Received: {"type":"welcome",...}` | server 確認連線 |
-| `Received: {"type":"headset_game_backend_command",...}` | 收到啟動指令 |
-| `Content cmdLine: -serverip=...` | 準備啟動 Content |
-| `Application launch successfully: com.quest.content` | Content 啟動成功 |
-| `Content alive -> REORDER_TO_FRONT: ...` | KioskService 把活著的 Content 拉回前景 |
-| `bringing Lobby back (fg=..., shouldRun=..., contentAlive=false)` | Content 死了／已 disconnect，Lobby 接手（回 Lobby 問 server） |
-| `Sent headset_check_reconnect: {...}` | Lobby 問 server 房間還在不在 |
-| `Network migration: 192.168.8.x -> 192.168.99.x` | 偵測到 IPv4 改變，重建 WebSocket |
-| `Network changed but Content owns clientId; Lobby will not reconnect` | 防 Lobby 搶 Content WS 連線 |
-| `Ignoring onFailure from stale WebSocket` | 舊 socket 的延遲回呼被正確忽略 |
+| Log | 意義 |
+|---|---|
+| `WebSocket connected (as Lobby)` | Lobby 已連線 Server |
+| `Content cmdLine: -serverip=...` | Lobby 已建立完整 Unreal 參數 |
+| `Intent extra to Content: cmdline=...` | 正確的全小寫 key 已放入 Intent |
+| `Application launch successfully` | Android 已接收 Content launch Intent |
+| `Meta/other foreground -> immediate Content pullback` | watchdog 快速拉回 Content |
+| `Content -> REORDER_TO_FRONT` | Content task 已送回前景 |
+| `bringing Lobby back` | 目前 session 不應執行 Content，因此拉回 Lobby |
+| `Sent headset_check_reconnect` | Lobby 正在向 Server 確認遊戲狀態 |
+| `dead (no pid found)` | Android 14 隱藏其他 App PID，不一定代表 Content 真的死亡 |
 
----
+## 疑難排解
 
-## 常見問題
+### 按 Meta Menu 後沒有回 Lobby／Content
 
-### Lobby 連不上 server
-- 確認 fiveg-local server 在 `192.168.99.200:5000` 跑著
-- 看 log 是否出現 `Failed to connect`
-- 確認 Quest 跟 server 在同網段
+```bat
+adb shell appops get com.quest.lobby GET_USAGE_STATS
+```
 
-### Dashboard 顯示 OFFLINE
-- Cloud DB 的 headset `id` 必須跟 Lobby 送的 `clientId` 完全一致
-- 看 log 確認 ClientID 是什麼（通常是 `340YC20G8C0J4Y` 從 HMDSN.jpg 讀的）
-- dashboard 上對應的 headset 紀錄 id 必須改成同一個
+必須是 `allow`。同時確認 `KioskService` 存活：
 
-### Operator 按啟動沒反應
-1. 確認 dashboard 顯示 H007（這台 Quest）是 ONLINE
-2. 確認 operator 選的房間有把這台 Quest 加入 pairing
-3. 看 log 找 `Received: {"type":"headset_game_backend_command"...}`
-   - 有 → Lobby 有收到，問題在啟動 Content
-   - 沒有 → server 沒送，問題在 dashboard / server / cloud DB 配置
+```bat
+adb shell dumpsys activity services com.quest.lobby
+```
 
-### Meta menu 按出後 Content 不回來
-- 確認 Lobby 是這版（kiosk watchdog 啟用）
-- 確認 PACKAGE_USAGE_STATS 已授權（`adb shell appops get com.quest.lobby GET_USAGE_STATS` 回 `allow`）
-- 看 log 是否有 `Kiosk FAST: ... bringing Content back`
+### Lobby 一直跳系統設定
 
-### Content 玩到一半被踢
-- 看 log 有沒有 `Network available, but Lobby is background — NOT reconnecting`
-- 如果常常出現 `Kiosk SLOW: fg=null` → UE 渲染沒觸發前景事件，已 patch 過
+表示特殊權限尚未核准。執行 `install-quest.bat`，或手動設定兩個 AppOps。
 
-### 重啟 Lobby 後沒自動跳回 Content
-- 只在 `content_should_run=true` 且 Content process 還活著時跳回
-- 如果 Content 也被結束 → Lobby 問 server，server 沒回應就停在 Lobby
-- 觀察 log 有沒有 `Auto re-launch successful` 或 `headset_check_reconnect`
+### Unreal 只取得 `-project="../../../HellVR/HellVR.uproject"`
 
----
+確認 Lobby log 包含：
 
-## 版本
+```text
+Intent extra to Content: cmdline=-serverip=...
+```
 
-- **2026-05-25 版本**（目前主版本）：用 server `headset_check_reconnect` 機制 + FAST PATH process 檢查
-- 備份位置：`f:/game/lobby_backup_2026-05-25/`、`f:/game/lobby_backup_2026-05-20/`
+如果看到 `CommandLine` 或 `cmdLine`，代表安裝的 Lobby APK 不是目前版本。正確 key 只有全小寫 `cmdline`。
+
+### Lobby 無法連線 Server
+
+確認 Quest 與 `192.168.99.200` 位於可互通網段。若 Quest IP 是 `192.168.9.x`，通常無法直接連到 `192.168.99.200`，log 會持續出現 timeout。
+
+### Meta Menu 仍能出現
+
+這是正常限制。Watchdog 只能在 Menu 出現後拉回 App，不能禁止 Meta 系統 UI。完全鎖定 Meta Menu 需要 Quest 企業 Kiosk／MDM 或 Device Owner；一般 `startLockTask()` 無法封鎖所有 Quest 系統介面。
+
+## 近期重要修正
+
+- 2026-07-16：加入 `install-quest.bat`，自動安裝並設定每台 Quest 的必要 AppOps。
+- 2026-07-16：Unreal Intent command-line key 修正為全小寫 `cmdline`；刪除錯誤的 `CommandLine`／`cmdLine`。
+- 2026-07-16：Activity recreation 不再清除有效的 `content_session_confirmed`。
+- 2026-07-15：Meta Menu 快速拉回要求 `content_should_run && content_session_confirmed`，避免 Lobby 閒置時誤啟動 Content。
