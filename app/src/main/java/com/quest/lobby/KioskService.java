@@ -123,6 +123,21 @@ public class KioskService extends Service {
         boolean sessionConfirmed = prefs.getBoolean("content_session_confirmed", false);
         String contentPkg = prefs.getString("content_package", MainActivity.DEFAULT_CONTENT_PACKAGE);
 
+        // Launch-grace guard — MUST run BEFORE any foreground/pullback logic. MainActivity.launchContent()
+        // writes should_run/session_confirmed/launched_at, then waits LAUNCH_DELAY_AFTER_DISCONNECT_MS
+        // before its own startActivity(). During that wait Quest briefly shows the Meta shell / a loading
+        // activity in the foreground. If the pullback block below ran, it would see "unexpected foreground"
+        // and call bringContentToFront() — launching Content EARLY, then MainActivity launches it AGAIN,
+        // double-starting the Unreal activity and hanging it on the 3-dot loading screen. Standing down for
+        // the whole grace window lets that single first launch settle.
+        long launchedAt = prefs.getLong("content_launched_at", 0);
+        if (shouldRun && launchedAt > 0
+                && System.currentTimeMillis() - launchedAt < LAUNCH_GRACE_MS) {
+            Log.d(TAG, "Content launch grace active (" + (System.currentTimeMillis() - launchedAt)
+                    + "ms since launch) — watchdog standing down, no pullback/launch");
+            return;
+        }
+
         MainActivity.Foreground immediateFgEvent = MainActivity.queryForeground(this);
         String immediateFg = immediateFgEvent == null ? null : immediateFgEvent.pkg;
         if (shouldRun && sessionConfirmed && immediateFg != null
@@ -141,11 +156,7 @@ public class KioskService extends Service {
             return;
         }
 
-        // While Content is legitimately starting up (or was just relaunched by us), don't fight it.
-        if (shouldRun) {
-            long launchedAt = prefs.getLong("content_launched_at", 0);
-            if (System.currentTimeMillis() - launchedAt < LAUNCH_GRACE_MS) return;
-        }
+        // (Launch-grace already handled at the top of doCheck, before any pullback logic.)
 
         // Content may only be the foreground target when ALL of these hold:
         //   content_should_run == true          — a session is meant to be active

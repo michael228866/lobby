@@ -36,6 +36,7 @@ import java.net.NetworkInterface;
 import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONObject;
 
@@ -112,7 +113,18 @@ public class MainActivity extends Activity {
     private OkHttpClient client;
     private volatile WebSocket webSocket;
     private Handler mainHandler;
-    private boolean contentLaunched = false;
+    // Written on the main thread (launch runnable / onResume / clearContentRuntimeState) and read by
+    // the duplicate-launch guard; volatile so the guard always sees the latest value.
+    private volatile boolean contentLaunched = false;
+    // Guards the launchContent() → delayed startActivity() window. A single connect launches Content
+    // after LAUNCH_DELAY_AFTER_DISCONNECT_MS; if the server (re)sends connect during that window, a
+    // second launchContent() would queue a second delayed startActivity() and double-start Content —
+    // hanging the Unreal activity on the 3-dot loading screen. AtomicBoolean.compareAndSet makes the
+    // "test-then-set" a single atomic step, so two near-simultaneous connects can't both pass.
+    private final AtomicBoolean contentLaunchInProgress = new AtomicBoolean(false);
+    // The pending delayed startActivity() Runnable (main-thread only). Held so a disconnect / destroy
+    // arriving inside the launch delay can cancel it before it fires and relaunches a closed game.
+    private Runnable pendingContentLaunchRunnable;
     private boolean pendingCheckReconnect = false;
     private boolean usageStatsSettingsRequested = false;
     private boolean storageSettingsRequested = false;
@@ -315,6 +327,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        cancelPendingContentLaunch("activity-destroyed");
         mainHandler.removeCallbacks(networkReconnectRunnable);
         mainHandler.removeCallbacks(reconnectRunnable);
         mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
@@ -639,23 +652,19 @@ public class MainActivity extends Activity {
         Log.d(TAG, "headset_game_backend_command: " + command);
 
         if ("connect".equals(command)) {
-            // Server has authoritatively confirmed this session → cancel the check-reconnect
-            // timeout and clear the pending flag so it can't later clear our now-valid state.
-            mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
-            pendingCheckReconnect = false;
-
             JSONObject connectData = json.optJSONObject("connectData");
             if (connectData == null) {
                 Log.e(TAG, "connect command missing connectData");
                 return;
             }
             // Server may send "packageName" (new fiveg-local) or "execPath" (legacy)
-            String pkg = connectData.optString("packageName", "");
-            if (pkg.isEmpty()) pkg = connectData.optString("execPath", "");
-            if (pkg.isEmpty()) {
+            String parsedPkg = connectData.optString("packageName", "");
+            if (parsedPkg.isEmpty()) parsedPkg = connectData.optString("execPath", "");
+            if (parsedPkg.isEmpty()) {
                 Log.e(TAG, "connectData has neither packageName nor execPath: " + connectData);
-                pkg = DEFAULT_CONTENT_PACKAGE;
+                parsedPkg = DEFAULT_CONTENT_PACKAGE;
             }
+            final String pkg = parsedPkg;
             // Build UE-style command-line string (matches OLD UE Blueprint behavior — see 跳轉帶入.png)
             String gameIp = connectData.optString("ip", "");
             int gamePort = connectData.optInt("port", 0);
@@ -695,23 +704,39 @@ public class MainActivity extends Activity {
                 extras.put("playerheight", String.valueOf(connectData.optDouble("playerheight", 0)));
             } catch (Exception ignored) {}
 
-            launchContent(pkg, extras);
+            final JSONObject launchExtras = extras;
+            // handleGameBackendCommand runs on the OkHttp WebSocket callback thread; hop to the main
+            // thread so all launch/disconnect state (flags, prefs, handler callbacks) is mutated on
+            // one thread only — no cross-thread races on contentLaunched / pendingContentLaunchRunnable.
+            mainHandler.post(() -> {
+                // Server authoritatively confirmed this session → cancel the check-reconnect timeout
+                // and clear the pending flag so it can't later clear our now-valid state.
+                mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
+                pendingCheckReconnect = false;
+                launchContent(pkg, launchExtras);
+            });
         } else if ("disconnect".equals(command)) {
-            Log.d(TAG, "Disconnect command received — stopping Content");
-            // Clear the "should be running" flag AND the session-confirmed flag so neither the
-            // watchdog nor a later onResume treats the old session as still valid.
-            mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
-            pendingCheckReconnect = false;
-            // Hold off the idle poll for the longer post-close settle so we don't ask again while the
-            // server is still tearing the game down (its room ip/port aren't cleared until closeServer
-            // finishes) — otherwise the next poll gets a connect reply and relaunches the closed game.
-            mainHandler.removeCallbacks(checkReconnectPollRunnable);
-            mainHandler.postDelayed(checkReconnectPollRunnable, POST_CLOSE_POLL_DELAY_MS);
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
-                .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false)
-                .apply();
-            stopContent();
+            // Also on the WebSocket thread — serialize onto main (see connect above).
+            mainHandler.post(() -> {
+                Log.d(TAG, "Disconnect command received — stopping Content");
+                // Kill any delayed launch still waiting out its window BEFORE stopContent(), so a
+                // just-closed game can't be relaunched by a runnable that was already queued.
+                cancelPendingContentLaunch("disconnect");
+                // Clear the "should be running" flag AND the session-confirmed flag so neither the
+                // watchdog nor a later onResume treats the old session as still valid.
+                mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
+                pendingCheckReconnect = false;
+                // Hold off the idle poll for the longer post-close settle so we don't ask again while
+                // the server is still tearing the game down (its room ip/port aren't cleared until
+                // closeServer finishes) — otherwise the next poll relaunches the closed game.
+                mainHandler.removeCallbacks(checkReconnectPollRunnable);
+                mainHandler.postDelayed(checkReconnectPollRunnable, POST_CLOSE_POLL_DELAY_MS);
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
+                    .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false)
+                    .apply();
+                stopContent();
+            });
         }
     }
 
@@ -720,11 +745,38 @@ public class MainActivity extends Activity {
     private void launchContent(String pkg, JSONObject extras) {
         Log.d(TAG, "Try launch apk: " + pkg);
 
+        // Duplicate-launch guard. contentLaunched means a live Content session is already up
+        // (cleared in onResume when we return to the Lobby, so a connect after Content closes still
+        // launches). compareAndSet atomically claims the in-progress slot: if it's already true, a
+        // launch is mid-flight and this connect is a duplicate → ignore. From here every exit path
+        // MUST release contentLaunchInProgress (clearContentRuntimeState does so via cancel).
+        if (contentLaunched) {
+            Log.w(TAG, "Ignoring duplicate Content launch request: " + pkg + " (already launched)");
+            return;
+        }
+        if (!contentLaunchInProgress.compareAndSet(false, true)) {
+            Log.w(TAG, "Ignoring duplicate Content launch request: " + pkg + " (launch already in progress)");
+            return;
+        }
+
         if (!isAppInstalled(pkg)) {
             Log.e(TAG, "Can't find application or not installed: " + pkg);
             sendStatus("launch_failed_not_installed");
+            // Don't leave should_run=true / confirmed=true pointing at an uninstalled package;
+            // clearContentRuntimeState also releases contentLaunchInProgress.
+            clearContentRuntimeState("launch-not-installed");
             return;
         }
+
+        // Defensive: the guard above blocks a concurrent launch, but make sure no stray delayed
+        // runnable survives from a prior cycle. Only drop the handle — keep our claimed in-progress.
+        if (pendingContentLaunchRunnable != null) {
+            mainHandler.removeCallbacks(pendingContentLaunchRunnable);
+            pendingContentLaunchRunnable = null;
+        }
+
+        // Whitelist Content for Lock Task now that we know it's installed, before we start it.
+        updateLockTaskAllowlist(pkg);
 
         sendStatus("content_launched");
         contentLaunched = true;
@@ -787,13 +839,28 @@ public class MainActivity extends Activity {
         // 2. Run WebSocket onClose handler
         // 3. Remove our client from clientManager
         // 4. Free up the clientId slot for Content to claim
-        mainHandler.postDelayed(() -> {
+        pendingContentLaunchRunnable = () -> {
+            pendingContentLaunchRunnable = null;   // executing now — no longer "pending" to cancel
+            Log.d(TAG, "Delayed launch runnable running now @" + System.currentTimeMillis()
+                    + " for " + pkg + " (waited " + LAUNCH_DELAY_AFTER_DISCONNECT_MS + "ms)");
+
+            // Second-layer guard: a disconnect during the delay may have cleared the session even if
+            // the cancel raced this execution. Never launch a session the server already tore down.
+            SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+            boolean shouldRun = prefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
+            boolean sessionConfirmed = prefs.getBoolean(PREF_CONTENT_SESSION_CONFIRMED, false);
+            if (!shouldRun || !sessionConfirmed) {
+                Log.w(TAG, "Skipping delayed Content launch because session is no longer active");
+                contentLaunchInProgress.set(false);
+                return;
+            }
+
             try {
                 PackageManager pm = getPackageManager();
                 Intent intent = pm.getLaunchIntentForPackage(pkg);
                 if (intent == null) {
                     Log.e(TAG, "No launch intent for: " + pkg);
-                    contentLaunched = false;
+                    clearContentRuntimeState("launch-intent-null");   // also releases inProgress
                     return;
                 }
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -817,6 +884,7 @@ public class MainActivity extends Activity {
                 }
 
                 startActivity(intent);
+                contentLaunchInProgress.set(false);   // launch dispatched; contentLaunched stays true
                 Log.d(TAG, "Application launch successfully: " + pkg + " @" + System.currentTimeMillis()
                         + " (clientId released " + LAUNCH_DELAY_AFTER_DISCONNECT_MS + "ms earlier)");
 
@@ -828,9 +896,25 @@ public class MainActivity extends Activity {
                         Log.d(TAG, "Content process alive after launch (+10s)? " + isContentProcessAlive(pkg)), 10000);
             } catch (Exception e) {
                 Log.e(TAG, "Failed to launch " + pkg + ": " + e.getMessage());
-                contentLaunched = false;
+                clearContentRuntimeState("startActivity-failed");   // also releases inProgress
             }
-        }, LAUNCH_DELAY_AFTER_DISCONNECT_MS);
+        };
+        mainHandler.postDelayed(pendingContentLaunchRunnable, LAUNCH_DELAY_AFTER_DISCONNECT_MS);
+    }
+
+    /**
+     * Cancel a delayed Content launch that hasn't fired yet and release the in-progress guard, so a
+     * disconnect / destroy inside the launch window can't later relaunch a game we've already left.
+     * Safe to call when nothing is pending. Logs only when it actually cancelled something.
+     */
+    private void cancelPendingContentLaunch(String reason) {
+        boolean had = pendingContentLaunchRunnable != null || contentLaunchInProgress.get();
+        if (pendingContentLaunchRunnable != null) {
+            mainHandler.removeCallbacks(pendingContentLaunchRunnable);
+            pendingContentLaunchRunnable = null;
+        }
+        contentLaunchInProgress.set(false);
+        if (had) Log.d(TAG, "Cancelled pending Content launch: " + reason);
     }
 
     private void stopContent() {
@@ -935,6 +1019,9 @@ public class MainActivity extends Activity {
      */
     private void clearContentRuntimeState(String reason) {
         Log.d(TAG, "Clearing Content runtime state: " + reason);
+        // Drop any delayed launch still queued and release the in-progress guard, so clearing state
+        // never leaves a Runnable that would later launch (or a stuck contentLaunchInProgress=true).
+        cancelPendingContentLaunch(reason);
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
                 .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false)
@@ -1139,6 +1226,33 @@ public class MainActivity extends Activity {
             }
         } catch (Exception e) {
             Log.e(TAG, "enableLockTaskWhitelist failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Add the Content package to the Lock Task allowlist alongside the Lobby, so a pinned kiosk
+     * can hand the foreground to Content without Lock Task blocking it. No-op (with a diagnostic
+     * log) when we are not device owner — existing behavior is preserved, nothing is thrown.
+     */
+    private void updateLockTaskAllowlist(String contentPackage) {
+        try {
+            DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+            if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
+                ComponentName admin = new ComponentName(this, LobbyAdminReceiver.class);
+                String[] allow = (contentPackage != null && !contentPackage.isEmpty()
+                        && !contentPackage.equals(getPackageName()))
+                        ? new String[]{ getPackageName(), contentPackage }
+                        : new String[]{ getPackageName() };
+                dpm.setLockTaskPackages(admin, allow);
+                Log.d(TAG, "Lock task allowlist updated: " + java.util.Arrays.toString(allow)
+                        + " | isLockTaskPermitted(" + contentPackage + ")="
+                        + dpm.isLockTaskPermitted(contentPackage));
+            } else {
+                Log.w(TAG, "Lock task allowlist: NOT device owner — leaving current behavior (allow "
+                        + contentPackage + " via manifest/none)");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "updateLockTaskAllowlist failed: " + e.getMessage());
         }
     }
 
