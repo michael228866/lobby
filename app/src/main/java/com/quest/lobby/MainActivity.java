@@ -203,11 +203,14 @@ public class MainActivity extends Activity {
 
         // enableLockTaskWhitelist() resets the allowlist to just the Lobby. If Android recreated the
         // Lobby while Content was legitimately running, that would drop Content from the allowlist and
-        // break its pinning. Re-add Content — but only when there's a real session (should_run), never
-        // a stale package.
-        boolean savedShouldRun = savedPrefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
-        if (savedShouldRun && savedPkg != null && !savedPkg.isEmpty()) {
-            Log.d(TAG, "Restoring Content Lock Task allowlist after Activity recreation: " + savedPkg);
+        // break its pinning. Re-add Content — but gate on content_session_confirmed, NOT should_run:
+        //   - Same-process Activity recreation: processInitialized is already true, so the confirmed
+        //     flag was NOT cleared above → a live session stays confirmed → restore HellVR allowlist.
+        //   - Fresh Lobby process: the !processInitialized block above just cleared confirmed=false →
+        //     we do NOT trust a stale should_run/package from a dead session → skip, no stale package.
+        boolean sessionConfirmed = savedPrefs.getBoolean(PREF_CONTENT_SESSION_CONFIRMED, false);
+        if (sessionConfirmed && savedPkg != null && !savedPkg.isEmpty()) {
+            Log.d(TAG, "Restoring Content Lock Task allowlist after Activity recreation (session confirmed): " + savedPkg);
             updateLockTaskAllowlist(savedPkg);
         }
 
