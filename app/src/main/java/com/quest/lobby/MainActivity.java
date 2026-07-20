@@ -201,6 +201,16 @@ public class MainActivity extends Activity {
 
         enableLockTaskWhitelist();
 
+        // enableLockTaskWhitelist() resets the allowlist to just the Lobby. If Android recreated the
+        // Lobby while Content was legitimately running, that would drop Content from the allowlist and
+        // break its pinning. Re-add Content — but only when there's a real session (should_run), never
+        // a stale package.
+        boolean savedShouldRun = savedPrefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
+        if (savedShouldRun && savedPkg != null && !savedPkg.isEmpty()) {
+            Log.d(TAG, "Restoring Content Lock Task allowlist after Activity recreation: " + savedPkg);
+            updateLockTaskAllowlist(savedPkg);
+        }
+
         serverUrl = buildServerUrl();
         Log.d(TAG, "Server URL: " + serverUrl);
 
@@ -722,6 +732,13 @@ public class MainActivity extends Activity {
                 // Kill any delayed launch still waiting out its window BEFORE stopContent(), so a
                 // just-closed game can't be relaunched by a runnable that was already queued.
                 cancelPendingContentLaunch("disconnect");
+                // Also clear contentLaunched here — launchContent() sets it true BEFORE the delayed
+                // startActivity(), so a disconnect inside the launch delay would otherwise leave it
+                // true and the duplicate guard would block every future connect. Do NOT rely on
+                // onResume() to clear it: the Lobby may already be foreground, and stopContent()'s
+                // startActivity() is not guaranteed to re-fire onResume().
+                contentLaunched = false;
+                Log.d(TAG, "Content launch state reset by server disconnect");
                 // Clear the "should be running" flag AND the session-confirmed flag so neither the
                 // watchdog nor a later onResume treats the old session as still valid.
                 mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
@@ -850,8 +867,11 @@ public class MainActivity extends Activity {
             boolean shouldRun = prefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
             boolean sessionConfirmed = prefs.getBoolean(PREF_CONTENT_SESSION_CONFIRMED, false);
             if (!shouldRun || !sessionConfirmed) {
-                Log.w(TAG, "Skipping delayed Content launch because session is no longer active");
+                Log.w(TAG, "Skipping delayed Content launch because session is no longer active"
+                        + " (shouldRun=" + shouldRun
+                        + ", sessionConfirmed=" + sessionConfirmed + ")");
                 contentLaunchInProgress.set(false);
+                contentLaunched = false;   // let the next server connect start Content again
                 return;
             }
 
