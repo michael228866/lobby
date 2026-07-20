@@ -54,10 +54,8 @@ public class MainActivity extends Activity {
     private static final String SERVER_HOST = "192.168.99.200";
     private static final int SERVER_PORT = 5000;
     private static final String CLIENT_TYPE = "vr_headset";
-    private static final String DEFAULT_ROOM_ID = "1234";
 
     private String serverUrl;
-    private String roomId = DEFAULT_ROOM_ID;
     // Client identity (clientId / headsetId) sent to the server AND passed to Content — now
     // the device IPv4 instead of the headset SN. Cached so every use is the exact same value.
     private String cachedClientId;
@@ -92,6 +90,16 @@ public class MainActivity extends Activity {
     static final String PREF_CONTENT_SESSION_CONFIRMED = "content_session_confirmed";
     // Give up waiting for the server's connect reply after this long → clear stale state, stay in Lobby.
     private static final long CHECK_RECONNECT_TIMEOUT_MS = 8000;
+    // While idle in the Lobby (connected, screen on, no Content), poll the server this often to ask
+    // whether a game is now active for this headset — so a game started while we were asleep / after
+    // a reboot / after our local state was cleared still gets picked up without asking on every
+    // single reconnect (which would race the server's game-close and relaunch a just-closed game).
+    private static final long CHECK_RECONNECT_POLL_MS = 10000;
+    // Longer settle used when we return to the Lobby straight from a Content session (game closed /
+    // Content stopped). The server needs time to finish tearing the game down (closeServer is async
+    // and only clears the room's ip/port when it completes); a longer first-poll delay makes sure
+    // we don't ask while it's mid-close and get told to relaunch the game we just left.
+    private static final long POST_CLOSE_POLL_DELAY_MS = 20000;
     // Skip reconnecting WebSocket for this long after launching Content
     // (Content owns the clientId during this window — Lobby reconnecting would evict it)
     private static final long CONTENT_GRACE_PERIOD_MS = 60000;
@@ -110,6 +118,13 @@ public class MainActivity extends Activity {
     private boolean storageSettingsRequested = false;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private android.content.BroadcastReceiver screenReceiver;
+    // True only while the Lobby Activity is in the foreground (between onResume and onPause). This
+    // is the RELIABLE "should the Lobby hold a WebSocket" signal — when Content is running the Lobby
+    // is paused, so lobbyResumed is false and no background reconnect fires. We must NOT rely on
+    // pidof/contentOwnsClientId for this: pidof can't see other apps on Android 14, so it wrongly
+    // reports a live Content as dead and the Lobby would reconnect and evict Content's clientId.
+    private volatile boolean lobbyResumed = false;
 
     // ── WebSocket / network-migration state machine ─────────────────────────────
     // socketState tracks the ONE live socket; there is never more than one at a time.
@@ -136,7 +151,14 @@ public class MainActivity extends Activity {
         // No setContentView - VR rendering is handled by native OpenXR
 
         mainHandler = new Handler(Looper.getMainLooper());
-        client = new OkHttpClient();
+        // pingInterval makes OkHttp send WS ping frames; if no pong comes back within the interval
+        // it declares the socket failed → onFailure → our normal reconnect. Without this, a socket
+        // that dies "half-open" (TCP dropped by an idle NAT/router with no close frame) is never
+        // noticed — webSocket stays non-null, no callback fires, and the Lobby sits disconnected
+        // forever. This is the "left it a while and it never reconnects" case.
+        client = new OkHttpClient.Builder()
+                .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS)
+                .build();
 
         FileLogger.start(this);
 
@@ -173,12 +195,82 @@ public class MainActivity extends Activity {
         loadPanorama();   // stash pixels before the render thread starts
         nativeCreate();
         registerNetworkCallback();
+        registerScreenReceiver();
+        connectWebSocket();
+        // First poll fires after one interval (not immediately) so a reconnect right after a
+        // game-close doesn't ask inside the server's close window and relaunch the closed game.
+        mainHandler.postDelayed(checkReconnectPollRunnable, CHECK_RECONNECT_POLL_MS);
+    }
+
+    /**
+     * Drop the WebSocket the moment the screen turns off and reopen it when it turns back on.
+     * SCREEN_OFF/ON (not onPause/onResume) is the precise signal: onPause also fires when we
+     * launch Content, which is NOT a sleep. During sleep Quest kills Wi-Fi, so a socket left open
+     * dies half-open and the server keeps thinking the headset is connected; a clean close on
+     * SCREEN_OFF + fresh connect on SCREEN_ON avoids that entirely.
+     */
+    private void registerScreenReceiver() {
+        screenReceiver = new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                String action = intent.getAction();
+                if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                    Log.d(TAG, "SCREEN_OFF — closing WebSocket for sleep");
+                    closeWebSocketForSleep();
+                } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                    Log.d(TAG, "SCREEN_ON — reconnecting WebSocket");
+                    reconnectAfterWake();
+                }
+            }
+        };
+        android.content.IntentFilter filter = new android.content.IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_SCREEN_ON);   // must be registered at runtime, not in manifest
+        registerReceiver(screenReceiver, filter);
+    }
+
+    /** Cancel pending reconnects and tear down the current socket so sleep holds no connection. */
+    private void closeWebSocketForSleep() {
+        mainHandler.removeCallbacks(reconnectRunnable);
+        mainHandler.removeCallbacks(networkReconnectRunnable);
+        WebSocket ws = webSocket;
+        if (ws != null) {
+            webSocket = null;                       // null FIRST so late callbacks are stale
+            socketState = SocketState.DISCONNECTED;
+            connectedSocketIpv4 = null;
+            ws.cancel();                            // immediate TCP teardown (server sees us drop)
+        }
+    }
+
+    /**
+     * True if the display is currently interactive (on). Used as a LIVE gate for background
+     * reconnects instead of a sticky "screenOff" flag: a sticky flag that only SCREEN_ON clears
+     * would wedge the Lobby offline forever if a single SCREEN_ON broadcast were ever missed. With
+     * a live query, any reconnect trigger (onResume, a network callback) self-heals once the screen
+     * is actually on, so a missed broadcast can never leave us permanently disconnected.
+     */
+    private boolean isScreenOn() {
+        android.os.PowerManager pm = (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+        return pm == null || pm.isInteractive();
+    }
+
+    /** Rebuild the URL from the current IPv4 and reconnect — unless Content owns the clientId. */
+    private void reconnectAfterWake() {
+        // A game may have started while we slept; onOpen will ask the server (sendCheckReconnect).
+        if (contentOwnsClientId()) {
+            Log.d(TAG, "SCREEN_ON but Content owns clientId; Lobby will not reconnect");
+            return;
+        }
+        if (webSocket != null) return;              // already (re)connecting via onResume
+        cachedClientId = null;                      // re-read IPv4 in case DHCP handed a new one
+        serverUrl = buildServerUrl();
         connectWebSocket();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        lobbyResumed = true;
 
         if (!hasUsageStatsPermission() && !usageStatsSettingsRequested) {
             usageStatsSettingsRequested = true;
@@ -193,44 +285,31 @@ public class MainActivity extends Activity {
 
         startKioskLockTask();
 
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        boolean shouldRun = prefs.getBoolean(PREF_CONTENT_SHOULD_RUN, false);
-        long launchedAt = prefs.getLong(PREF_CONTENT_LAUNCHED_AT, 0);
-        long sinceLaunch = System.currentTimeMillis() - launchedAt;
-
-        // A previous Content session was flagged "should be running". Content's start authority
-        // belongs to the SERVER ONLY — never relaunch Content locally from SharedPreferences or
-        // from "process is still alive". Ask the server (headset_check_reconnect) and let it
-        // decide: it replies with a connect command if the game is still active (then we
-        // launchContent), or stays silent → the check-reconnect timeout clears the stale state
-        // and we stay in the Lobby.
-        if (shouldRun && sinceLaunch < CONTENT_AUTO_RELAUNCH_WINDOW_MS) {
-            String fg = getForegroundPackage();
-            // Even if Content is already in front, do NOT relaunch — but still ask the server so
-            // the session gets re-confirmed (content_session_confirmed) before the watchdog will
-            // hold Content in front again.
-            if (fg != null && fg.equals(currentContentPackage)) {
-                Log.d(TAG, "Content already in foreground; leaving it alone, will confirm with server");
-            }
-            Log.d(TAG, "Previous Content session found — asking server before any relaunch (no local fast-path)");
-            pendingCheckReconnect = true;
-        }
-
-        // Connect WebSocket (onOpen sends headset_check_reconnect when pendingCheckReconnect is set).
+        // The Lobby is in the foreground now, so it should hold a WebSocket. Reconnect if needed.
+        // We do NOT ask the server here — all game-discovery goes through the periodic poll, whose
+        // first tick we (re)arm CHECK_RECONNECT_POLL_MS out. That settle window is what stops the
+        // "operator closed the game, Lobby comes forward, immediately asks, server is still mid-close
+        // and replies connect → game relaunches" bug: by the time the poll asks, the close is done.
+        // If contentLaunched is still true here, we are coming back to the Lobby straight from a
+        // Content session (we launched it, then it stopped / was closed) — use the longer settle so
+        // the first poll waits for the server's game-close to finish. Otherwise it's a plain idle
+        // resume → normal settle.
+        long firstPollDelay = contentLaunched ? POST_CLOSE_POLL_DELAY_MS : CHECK_RECONNECT_POLL_MS;
         contentLaunched = false;
-        if (webSocket == null) {
+        if (webSocket == null && !contentOwnsClientId()) {
             connectWebSocket();
-        } else if (pendingCheckReconnect && socketState == SocketState.CONNECTED) {
-            // Already connected — onOpen won't fire again, so ask the server right now.
-            sendCheckReconnect();
         }
+        mainHandler.removeCallbacks(checkReconnectPollRunnable);
+        mainHandler.postDelayed(checkReconnectPollRunnable, firstPollDelay);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        // Watchdog is handled solely by KioskService (foreground service) — see onCreate.
-        // The Activity intentionally runs NO watchdog, so there is only one watchdog owner.
+        // Lobby is no longer in the foreground (Content launched, screen off, or backgrounded). Mark
+        // it so no background reconnect fires — that is what stops the Lobby from reconnecting during
+        // a game and evicting Content's clientId. Watchdog stays solely in KioskService (see onCreate).
+        lobbyResumed = false;
     }
 
     @Override
@@ -239,9 +318,14 @@ public class MainActivity extends Activity {
         mainHandler.removeCallbacks(networkReconnectRunnable);
         mainHandler.removeCallbacks(reconnectRunnable);
         mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
+        mainHandler.removeCallbacks(checkReconnectPollRunnable);
         if (networkCallback != null) {
             connectivityManager.unregisterNetworkCallback(networkCallback);
             networkCallback = null;
+        }
+        if (screenReceiver != null) {
+            try { unregisterReceiver(screenReceiver); } catch (Exception ignored) {}
+            screenReceiver = null;
         }
         if (webSocket != null) {
             webSocket.close(1000, "App destroyed");
@@ -332,8 +416,11 @@ public class MainActivity extends Activity {
     private final Runnable networkReconnectRunnable = new Runnable() {
         @Override
         public void run() {
-            // Content owns the shared clientId while it runs — the Lobby must not reconnect and
-            // evict it, even across a network change. Re-evaluate once Content is gone.
+            // Only reconnect on a network change while the Lobby itself is in the foreground. During
+            // a game the Lobby is paused — reconnecting then would evict Content's clientId (and
+            // pidof can't be trusted to detect that on Android 14, so lobbyResumed is the gate).
+            if (!lobbyResumed) return;
+            if (!isScreenOn()) return;   // screen off: hold no socket until it wakes
             if (contentOwnsClientId()) {
                 Log.d(TAG, "Network changed but Content owns clientId; Lobby will not reconnect");
                 return;
@@ -404,11 +491,14 @@ public class MainActivity extends Activity {
 
     private String buildServerUrl() {
         String clientId = getClientId();
-        // Per spec, VR headset URL must include roomId (default "1234" matches OLD UE).
+        // The Lobby connects WITHOUT a roomId on purpose. fiveg-local uses `isContent = !!roomId`
+        // (onVrHeadsetOpen) to tell Lobby from Content — a roomId here makes the server treat the
+        // Lobby as Content and broadcast a game-backend "connect" to operators, lighting the
+        // GameServerIndicator on a mere Lobby connect. Only Content carries a roomId. Reconnect
+        // discovery uses headsetId (headset_check_reconnect), not this URL, so nothing is lost.
         return "ws://" + SERVER_HOST + ":" + SERVER_PORT
                 + "/?type=" + CLIENT_TYPE
-                + "&clientId=" + clientId
-                + "&roomId=" + roomId;
+                + "&clientId=" + clientId;
     }
 
     private String getClientId() {
@@ -475,14 +565,9 @@ public class MainActivity extends Activity {
                 connectedSocketIpv4 = pendingSocketIpv4;
                 if (connectedSocketIpv4 != null) lastConnectedIpv4 = connectedSocketIpv4;
                 Log.d(TAG, "WebSocket connected (as Lobby) on IPv4=" + connectedSocketIpv4);
-                // If we returned from a previous Content session, ask server whether the game is
-                // still active. Server replies with headset_game_backend_command + connect if
-                // active, silent otherwise. Do NOT clear pendingCheckReconnect here — it stays set
-                // until either the connect command arrives or the check-reconnect timeout fires
-                // (sendCheckReconnect arms that timeout).
-                if (pendingCheckReconnect) {
-                    sendCheckReconnect();
-                }
+                // Do NOT ask the server on connect — the periodic poll (first tick armed a settle
+                // window out) is the single game-discovery path. Asking on every connect used to
+                // race the server's game-close and relaunch a just-closed game.
             }
 
             @Override
@@ -610,13 +695,6 @@ public class MainActivity extends Activity {
                 extras.put("playerheight", String.valueOf(connectData.optDouble("playerheight", 0)));
             } catch (Exception ignored) {}
 
-            // Sync roomId for future reconnects
-            String newRoomId = connectData.optString("roomId", "");
-            if (!newRoomId.isEmpty()) {
-                roomId = newRoomId;
-                serverUrl = buildServerUrl();
-            }
-
             launchContent(pkg, extras);
         } else if ("disconnect".equals(command)) {
             Log.d(TAG, "Disconnect command received — stopping Content");
@@ -624,6 +702,11 @@ public class MainActivity extends Activity {
             // watchdog nor a later onResume treats the old session as still valid.
             mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
             pendingCheckReconnect = false;
+            // Hold off the idle poll for the longer post-close settle so we don't ask again while the
+            // server is still tearing the game down (its room ip/port aren't cleared until closeServer
+            // finishes) — otherwise the next poll gets a connect reply and relaunches the closed game.
+            mainHandler.removeCallbacks(checkReconnectPollRunnable);
+            mainHandler.postDelayed(checkReconnectPollRunnable, POST_CLOSE_POLL_DELAY_MS);
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putBoolean(PREF_CONTENT_SHOULD_RUN, false)
                 .putBoolean(PREF_CONTENT_SESSION_CONFIRMED, false)
@@ -780,21 +863,56 @@ public class MainActivity extends Activity {
      * Spec: fiveg-local/src/handlers/headset-check-reconnect.ts
      */
     private void sendCheckReconnect() {
-        if (webSocket == null) return;
+        if (!sendCheckReconnectMessage()) return;
+        // Arm the server-response timeout. If no connect command arrives within
+        // CHECK_RECONNECT_TIMEOUT_MS, the runnable clears the stale state and we stay in Lobby.
+        // Only the pendingCheckReconnect path (verifying a remembered session) uses this timeout —
+        // the periodic idle poll does NOT, so a silent poll never clears anything.
+        mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
+        mainHandler.postDelayed(checkReconnectTimeoutRunnable, CHECK_RECONNECT_TIMEOUT_MS);
+    }
+
+    /** Send the check_reconnect query only (no response timeout). Returns false if no live socket. */
+    private boolean sendCheckReconnectMessage() {
+        if (webSocket == null) return false;
         try {
             JSONObject json = new JSONObject();
             json.put("type", "headset_check_reconnect");
             json.put("headsetId", getClientId());
             webSocket.send(json.toString());
             Log.d(TAG, "Sent headset_check_reconnect: " + json);
-            // Arm the server-response timeout. If no connect command arrives within
-            // CHECK_RECONNECT_TIMEOUT_MS, the runnable clears the stale state and we stay in Lobby.
-            mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
-            mainHandler.postDelayed(checkReconnectTimeoutRunnable, CHECK_RECONNECT_TIMEOUT_MS);
+            return true;
         } catch (Exception e) {
             Log.e(TAG, "headset_check_reconnect send failed: " + e.getMessage());
+            return false;
         }
     }
+
+    /**
+     * Periodic idle poll: while the Lobby is connected, awake, and Content is NOT running, ask the
+     * server every CHECK_RECONNECT_POLL_MS whether a game is now active. Server replies connect → we
+     * jump; silent → we stay and poll again. Self-reschedules forever and self-gates, so it does
+     * nothing (but keep ticking) during a game or during sleep. Uses the bare query (no
+     * timeout/clear) — polling must never clear the pendingCheckReconnect session state.
+     */
+    private final Runnable checkReconnectPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            // Only when the Lobby itself is in the foreground (not during a game — Content is then in
+            // front and owns the clientId) and not inside Content's launch grace window.
+            if (lobbyResumed && !contentOwnsClientId()) {
+                if (webSocket != null && socketState == SocketState.CONNECTED) {
+                    sendCheckReconnectMessage();
+                } else if (webSocket == null) {
+                    // Connection watchdog: we're a foreground Lobby with no socket — make sure a
+                    // reconnect is queued (covers a drop that no callback re-armed).
+                    Log.d(TAG, "Idle poll: WebSocket is down while Lobby is foreground — ensuring reconnect");
+                    scheduleReconnect();
+                }
+            }
+            mainHandler.postDelayed(this, CHECK_RECONNECT_POLL_MS);
+        }
+    };
 
     /**
      * Fired when the server does not answer headset_check_reconnect with a connect command in time.
@@ -853,7 +971,7 @@ public class MainActivity extends Activity {
     private final Runnable reconnectRunnable = new Runnable() {
         @Override
         public void run() {
-            if (webSocket == null && !contentOwnsClientId()) {
+            if (webSocket == null && lobbyResumed && !contentOwnsClientId()) {
                 // Re-read IPv4 first: the drop may itself have been a network change, so rebuild
                 // the URL from the current IPv4 rather than reconnecting on a stale one.
                 String currentIpv4 = getDeviceIpv4();
@@ -872,6 +990,8 @@ public class MainActivity extends Activity {
         // When the server is simply unreachable (e.g. current Wi-Fi has no route to SERVER_HOST),
         // this keeps us in DISCONNECTED and retries; a later network migration to a reachable
         // subnet reconnects automatically.
+        if (!lobbyResumed) return;   // only the foreground Lobby reconnects (never during a game)
+        if (!isScreenOn()) return;   // screen off: don't retry until it wakes
         if (contentOwnsClientId()) return;
         mainHandler.removeCallbacks(reconnectRunnable);
         mainHandler.postDelayed(reconnectRunnable, RECONNECT_DELAY_MS);
