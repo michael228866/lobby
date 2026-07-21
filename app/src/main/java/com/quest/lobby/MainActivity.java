@@ -94,7 +94,7 @@ public class MainActivity extends Activity {
     // whether a game is now active for this headset — so a game started while we were asleep / after
     // a reboot / after our local state was cleared still gets picked up without asking on every
     // single reconnect (which would race the server's game-close and relaunch a just-closed game).
-    private static final long CHECK_RECONNECT_POLL_MS = 10000;
+    private static final long CHECK_RECONNECT_POLL_MS = 5000;
     // Longer settle used when we return to the Lobby straight from a Content session (game closed /
     // Content stopped). The server needs time to finish tearing the game down (closeServer is async
     // and only clears the room's ip/port when it completes); a longer first-poll delay makes sure
