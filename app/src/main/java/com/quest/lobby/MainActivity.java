@@ -284,7 +284,18 @@ public class MainActivity extends Activity {
 
     /** Rebuild the URL from the current IPv4 and reconnect — unless Content owns the clientId. */
     private void reconnectAfterWake() {
-        // A game may have started while we slept; onOpen will ask the server (sendCheckReconnect).
+        // Only the FOREGROUND Lobby may reconnect on wake. During a game the Lobby is paused
+        // (lobbyResumed=false); reconnecting then re-uses the shared clientId (device IPv4) and
+        // evicts Content on the server. lobbyResumed is the reliable gate — do NOT rely on
+        // contentOwnsClientId() alone here, because it falls back to pidof and Android 14 hides
+        // other apps' PIDs, so a live Content reads as dead and we'd wrongly reconnect. This was
+        // the one reconnect path missing this guard (the network/plain/scheduleReconnect paths
+        // all have it), which is why a sleep/wake during a game could steal Content's connection.
+        if (!lobbyResumed) {
+            Log.d(TAG, "SCREEN_ON but Lobby is backgrounded (game running); not reconnecting");
+            return;
+        }
+        // A game may have started while we slept; the idle poll will ask the server after onOpen.
         if (contentOwnsClientId()) {
             Log.d(TAG, "SCREEN_ON but Content owns clientId; Lobby will not reconnect");
             return;
@@ -318,11 +329,17 @@ public class MainActivity extends Activity {
         // first tick we (re)arm CHECK_RECONNECT_POLL_MS out. That settle window is what stops the
         // "operator closed the game, Lobby comes forward, immediately asks, server is still mid-close
         // and replies connect → game relaunches" bug: by the time the poll asks, the close is done.
-        // If contentLaunched is still true here, we are coming back to the Lobby straight from a
-        // Content session (we launched it, then it stopped / was closed) — use the longer settle so
-        // the first poll waits for the server's game-close to finish. Otherwise it's a plain idle
-        // resume → normal settle.
-        long firstPollDelay = contentLaunched ? POST_CLOSE_POLL_DELAY_MS : CHECK_RECONNECT_POLL_MS;
+        // The long post-close settle is ONLY to avoid racing the SERVER's own game-close (disconnect
+        // → should_run=false, its room teardown is async). Use it only when the game was actually
+        // closed. If content_should_run is still true, we came back because Content crashed / was
+        // killed (e.g. adb) while the server still wants the game — there is no close window to wait
+        // out, so poll fast and let the server re-confirm → relaunch quickly (was wrongly waiting the
+        // full 20s here). contentLaunched distinguishes "returned from a Content session" from a
+        // plain idle resume.
+        boolean gameStillActive = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_CONTENT_SHOULD_RUN, false);
+        long firstPollDelay = (contentLaunched && !gameStillActive)
+                ? POST_CLOSE_POLL_DELAY_MS : CHECK_RECONNECT_POLL_MS;
         contentLaunched = false;
         if (webSocket == null && !contentOwnsClientId()) {
             connectWebSocket();
