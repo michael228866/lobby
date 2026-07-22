@@ -9,7 +9,11 @@ import android.util.Log;
 
 public class BootReceiver extends BroadcastReceiver {
 
-    private static final long BOOT_DELAY_MS = 5000;
+    // ponytail: calibration knob. 5s was too early on a cold boot — the Quest OpenXR runtime and
+    // camera/tracking services aren't up yet, so the VR session fails to init. The native render
+    // thread now retries init, but starting later avoids the retry churn (and a possibly poisoned
+    // runtime). Tune per device if boot is slower.
+    private static final long BOOT_DELAY_MS = 15000;
 
     @Override
     public void onReceive(Context context, Intent intent) {

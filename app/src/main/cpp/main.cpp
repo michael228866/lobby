@@ -9,6 +9,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <vector>
 #include <cstring>
@@ -66,6 +67,18 @@ static GLuint gPanoTex = 0;
 static GLuint gPanoProgram = 0;
 static GLuint gPanoVAO = 0;
 
+// Wake-prompt image, shown flat/fullscreen when the headset is NOT woken (6DOF POSITION_TRACKED==0)
+// — i.e. after an off-face boot on a Quest 3S (no proximity sensor) before staff wakes it. Same
+// upload path as the panorama; drawn by the pano program in "flat" mode (uFlat=1).
+static std::vector<uint8_t> gWakePixels;
+static int gWakeW = 0;
+static int gWakeH = 0;
+static std::atomic<bool> gWakeDirty{false};
+static GLuint gWakeTex = 0;
+// Debounced "is the headset woken" state (updated each frame from POSITION_TRACKED).
+static bool gWoken = false;
+static int gWokenStreak = 0;
+
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -83,9 +96,20 @@ static GLuint compileShader(GLenum type, const char* src) {
 }
 
 static const char* PANO_VS = R"(#version 300 es
-// Fullscreen triangle, no vertex buffer needed.
+// uFlat==0: fullscreen triangle (panorama). uFlat==1: a centered quad (the wake-prompt popup),
+// sized by uPopupHalf (half-extent in NDC) so a square image stays square on screen.
 out vec2 vUV;
+uniform highp int  uFlat;
+uniform highp vec2 uPopupHalf;
+const vec2 QUAD[6] = vec2[6](vec2(-1.,-1.), vec2(1.,-1.), vec2(-1.,1.),
+                             vec2(-1.,1.),  vec2(1.,-1.), vec2(1.,1.));
 void main() {
+    if (uFlat == 1) {
+        vec2 c = QUAD[gl_VertexID];
+        vUV = c * 0.5 + 0.5;
+        gl_Position = vec4(c * uPopupHalf, 0.0, 1.0);
+        return;
+    }
     vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
                   (gl_VertexID == 2) ? 3.0 : -1.0);
     vUV = p * 0.5 + 0.5;
@@ -100,6 +124,7 @@ out vec4 frag;
 uniform sampler2D uPano;
 uniform vec4 uFovTan;  // (tanLeft, tanRight, tanDown, tanUp); Left/Down are negative
 uniform vec4 uQuat;    // head orientation quaternion (x, y, z, w)
+uniform highp int uFlat;  // 1 = draw the texture flat (wake prompt), 0 = equirect panorama
 
 vec3 rotate(vec4 q, vec3 v) {
     vec3 t = 2.0 * cross(q.xyz, v);
@@ -107,6 +132,11 @@ vec3 rotate(vec4 q, vec3 v) {
 }
 
 void main() {
+    if (uFlat == 1) {
+        // Flat, head-locked prompt image (row 0 = top, so flip V).
+        frag = texture(uPano, vec2(vUV.x, 1.0 - vUV.y));
+        return;
+    }
     // View-space ray from per-eye fov tangents (view looks down -Z).
     float x = mix(uFovTan.x, uFovTan.y, vUV.x);
     float y = mix(uFovTan.z, uFovTan.w, vUV.y);
@@ -144,21 +174,27 @@ static void initPanoProgram() {
     LOGI("pano program ready");
 }
 
-static void uploadPanoIfNeeded() {
-    if (!gPanoDirty.load()) return;
-    gPanoDirty = false;
-    if (gPanoPixels.empty() || gPanoW <= 0 || gPanoH <= 0) return;
-    if (gPanoTex == 0) glGenTextures(1, &gPanoTex);
-    glBindTexture(GL_TEXTURE_2D, gPanoTex);
+static void uploadTexIfDirty(std::atomic<bool>& dirty, std::vector<uint8_t>& px,
+                             int w, int h, GLuint& tex, GLint wrapS, const char* name) {
+    if (!dirty.load()) return;
+    dirty = false;
+    if (px.empty() || w <= 0 || h <= 0) return;
+    if (tex == 0) glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);        // seamless horizontal wrap
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE); // clamp poles
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     // Upload as sRGB so sampling returns linear; the sRGB swapchain re-encodes on write.
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, gPanoW, gPanoH, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, gPanoPixels.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, w, h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     glBindTexture(GL_TEXTURE_2D, 0);
-    LOGI("pano texture uploaded %dx%d", gPanoW, gPanoH);
+    LOGI("%s texture uploaded %dx%d", name, w, h);
+}
+
+static void uploadTexturesIfNeeded() {
+    uploadTexIfDirty(gPanoDirty, gPanoPixels, gPanoW, gPanoH, gPanoTex, GL_REPEAT, "pano");
+    uploadTexIfDirty(gWakeDirty, gWakePixels, gWakeW, gWakeH, gWakeTex, GL_CLAMP_TO_EDGE, "wake");
 }
 
 // ---- EGL ----
@@ -361,7 +397,7 @@ static void handleEvents() {
 static void renderFrame() {
     if (!gSessionReady) return;
 
-    uploadPanoIfNeeded();  // GL context is current on this thread
+    uploadTexturesIfNeeded();  // GL context is current on this thread
 
     XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState = {XR_TYPE_FRAME_STATE};
@@ -386,6 +422,19 @@ static void renderFrame() {
         XrViewState viewState = {XR_TYPE_VIEW_STATE};
         xrLocateViews(gSession, &locateInfo, &viewState, viewCount, &viewCount, views.data());
 
+        // Is the camera-driven 6DOF pose tracked? After an off-face boot on Quest 3S (no proximity
+        // sensor → no auto-wake) the cameras stay idle → POSITION_TRACKED is 0; it flips to 1 once
+        // staff wakes the headset (power button / double-tap), which is exactly when passthrough and
+        // hand tracking also start working. Debounce ~0.5s each way so the prompt doesn't flicker.
+        bool posTracked = (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
+        if (posTracked == gWoken) {
+            gWokenStreak = 0;
+        } else if (++gWokenStreak >= 30) {
+            gWoken = posTracked;
+            gWokenStreak = 0;
+            LOGI("Woken state -> %d (POSITION_TRACKED)", gWoken ? 1 : 0);
+        }
+
         projViews.resize(viewCount);
         for (uint32_t i = 0; i < viewCount; i++) {
             XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -396,13 +445,16 @@ static void renderFrame() {
             swWait.timeout = XR_INFINITE_DURATION;
             xrWaitSwapchainImage(gSwapchains[i].handle, &swWait);
 
+            bool notWoken = !gWoken;
+
             glBindFramebuffer(GL_FRAMEBUFFER, gSwapchains[i].framebuffers[imgIdx]);
             glViewport(0, 0, gSwapchains[i].width, gSwapchains[i].height);
-            glClearColor(CLEAR_R, CLEAR_G, CLEAR_B, 1.0f);
+            // Orange fallback only if we must prompt but no wake image is loaded; else dark blue.
+            if (notWoken && gWakeTex == 0) glClearColor(0.6f, 0.25f, 0.0f, 1.0f);
+            else                           glClearColor(CLEAR_R, CLEAR_G, CLEAR_B, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-            // Draw the 360 panorama as the background, using this eye's fov + head orientation.
-            if (gPanoTex != 0 && gPanoProgram != 0) {
+            if (gPanoProgram != 0) {
                 glDisable(GL_DEPTH_TEST);
                 glDepthMask(GL_FALSE);
                 glUseProgram(gPanoProgram);
@@ -413,10 +465,23 @@ static void renderFrame() {
                             tanf(fov.angleDown), tanf(fov.angleUp));
                 glUniform4f(glGetUniformLocation(gPanoProgram, "uQuat"), q.x, q.y, q.z, q.w);
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, gPanoTex);
                 glUniform1i(glGetUniformLocation(gPanoProgram, "uPano"), 0);
                 glBindVertexArray(gPanoVAO);
-                glDrawArrays(GL_TRIANGLES, 0, 3);
+
+                // Background: the 360 panorama (always, when available).
+                if (gPanoTex != 0) {
+                    glUniform1i(glGetUniformLocation(gPanoProgram, "uFlat"), 0);
+                    glBindTexture(GL_TEXTURE_2D, gPanoTex);
+                    glDrawArrays(GL_TRIANGLES, 0, 3);
+                }
+                // Popup: the wake-prompt image, centered & kept square, only while not woken.
+                if (notWoken && gWakeTex != 0) {
+                    float aspect = (float)gSwapchains[i].height / (float)gSwapchains[i].width;
+                    glUniform1i(glGetUniformLocation(gPanoProgram, "uFlat"), 1);
+                    glUniform2f(glGetUniformLocation(gPanoProgram, "uPopupHalf"), 0.5f * aspect, 0.5f);
+                    glBindTexture(GL_TEXTURE_2D, gWakeTex);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                }
                 glBindVertexArray(0);
                 glDepthMask(GL_TRUE);
             }
@@ -449,6 +514,7 @@ static void renderFrame() {
 // ---- Cleanup ----
 static void shutdownOpenXR() {
     if (gPanoTex)     { glDeleteTextures(1, &gPanoTex); gPanoTex = 0; }
+    if (gWakeTex)     { glDeleteTextures(1, &gWakeTex); gWakeTex = 0; }
     if (gPanoVAO)     { glDeleteVertexArrays(1, &gPanoVAO); gPanoVAO = 0; }
     if (gPanoProgram) { glDeleteProgram(gPanoProgram); gPanoProgram = 0; }
     for (auto& sc : gSwapchains) {
@@ -468,7 +534,17 @@ static void shutdownOpenXR() {
 // ---- Render thread ----
 static void renderThreadFunc() {
     if (!initEGL()) { LOGE("EGL init failed"); return; }
-    if (!initOpenXR()) { LOGE("OpenXR init failed"); shutdownEGL(); return; }
+
+    // At cold boot the Quest OpenXR runtime (xrGetSystem / xrCreateSession) may not be ready yet.
+    // Retry instead of giving up forever, and shutdownOpenXR() between attempts releases any handle
+    // the failed attempt created (the old code only called shutdownEGL(), leaking the XrInstance).
+    int attempt = 0;
+    while (gRunning && !initOpenXR()) {
+        LOGE("OpenXR init failed (attempt %d) — runtime not ready, retrying in 1s", ++attempt);
+        shutdownOpenXR();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (!gRunning) { shutdownOpenXR(); shutdownEGL(); return; }
 
     initPanoProgram();
 
@@ -505,6 +581,22 @@ Java_com_quest_lobby_MainActivity_nativeSetPanorama(JNIEnv* env, jobject, jint w
     gPanoH = h;
     gPanoDirty = true;   // render thread uploads it on the next frame
     LOGI("nativeSetPanorama received %dx%d", w, h);
+}
+
+JNIEXPORT void JNICALL
+Java_com_quest_lobby_MainActivity_nativeSetWakeImage(JNIEnv* env, jobject, jint w, jint h, jobject buffer) {
+    void* addr = env->GetDirectBufferAddress(buffer);
+    if (!addr || w <= 0 || h <= 0) {
+        LOGE("nativeSetWakeImage: bad input (addr=%p, %dx%d)", addr, w, h);
+        return;
+    }
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    uint8_t* p = (uint8_t*)addr;
+    gWakePixels.assign(p, p + bytes);
+    gWakeW = w;
+    gWakeH = h;
+    gWakeDirty = true;
+    LOGI("nativeSetWakeImage received %dx%d", w, h);
 }
 
 JNIEXPORT void JNICALL

@@ -72,6 +72,8 @@ public class MainActivity extends Activity {
     private native void nativeDestroy();
     // Hand the decoded 360 panorama (RGBA8, row 0 = top) to the native render thread.
     private native void nativeSetPanorama(int width, int height, java.nio.ByteBuffer pixels);
+    // Wake-prompt image shown when the headset isn't woken (Quest 3S off-face boot). Optional asset.
+    private native void nativeSetWakeImage(int width, int height, java.nio.ByteBuffer pixels);
 
     // Shared with KioskService so the watchdog's default target matches this Activity's
     // default before SharedPreferences (content_package) has been written by launchContent().
@@ -217,7 +219,8 @@ public class MainActivity extends Activity {
         serverUrl = buildServerUrl();
         Log.d(TAG, "Server URL: " + serverUrl);
 
-        loadPanorama();   // stash pixels before the render thread starts
+        loadImageAsset("scene.png", false);         // 360 panorama background
+        loadImageAsset("wake_prompt.png", true);     // optional "please wake" prompt (may be absent)
         nativeCreate();
         registerNetworkCallback();
         registerScreenReceiver();
@@ -1209,12 +1212,16 @@ public class MainActivity extends Activity {
         return latestPackage == null ? null : new Foreground(latestPackage, latestTime);
     }
 
-    /** Decode assets/scene.png and hand its pixels to native as the VR background. */
-    private void loadPanorama() {
-        try (java.io.InputStream is = getAssets().open("scene.png")) {
+    /**
+     * Decode an assets PNG and hand its pixels to native. {@code wake=false} → 360 panorama
+     * background; {@code wake=true} → the optional "please wake the headset" prompt image. A missing
+     * wake_prompt.png is not an error — native falls back to a plain colour when it isn't woken.
+     */
+    private void loadImageAsset(String asset, boolean wake) {
+        try (java.io.InputStream is = getAssets().open(asset)) {
             android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeStream(is);
             if (bmp == null) {
-                Log.e(TAG, "Panorama decode failed (scene.png)");
+                Log.e(TAG, "Image decode failed: " + asset);
                 return;
             }
             int w = bmp.getWidth();
@@ -1223,11 +1230,15 @@ public class MainActivity extends Activity {
             java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect(w * h * 4);
             bmp.copyPixelsToBuffer(buf);
             buf.rewind();
-            nativeSetPanorama(w, h, buf);   // native copies synchronously
+            if (wake) nativeSetWakeImage(w, h, buf);   // native copies synchronously
+            else      nativeSetPanorama(w, h, buf);
             bmp.recycle();
-            Log.d(TAG, "Panorama loaded: " + w + "x" + h);
+            Log.d(TAG, "Image loaded: " + asset + " " + w + "x" + h);
+        } catch (java.io.FileNotFoundException e) {
+            if (wake) Log.d(TAG, "No wake_prompt.png asset — not-woken screen uses a plain colour");
+            else      Log.e(TAG, "Missing required asset: " + asset);
         } catch (Exception e) {
-            Log.e(TAG, "loadPanorama failed: " + e.getMessage());
+            Log.e(TAG, "loadImageAsset(" + asset + ") failed: " + e.getMessage());
         }
     }
 
