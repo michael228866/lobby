@@ -138,9 +138,18 @@ public class KioskService extends Service {
             return;
         }
 
+        // Is Content actually still the active app? (UsageStats last-used, not pidof — see
+        // isAliveCached.) This gates BOTH the immediate pullback below and the target logic further
+        // down: without it the pullback relaunches Content purely on a stale should_run=true, which is
+        // exactly the "I'm sitting in the Lobby, the game was already closed on the server, I sleep,
+        // and waking relaunches the dead game" bug. The server closes a game by telling only Content
+        // (HellVR) — the Lobby never receives that disconnect and its should_run stays stale-true — so
+        // should_run alone must never trigger a launch; Content must look genuinely alive too.
+        boolean contentAlive = shouldRun && isAliveCached(contentPkg);
+
         MainActivity.Foreground immediateFgEvent = MainActivity.queryForeground(this);
         String immediateFg = immediateFgEvent == null ? null : immediateFgEvent.pkg;
-        if (shouldRun && sessionConfirmed && immediateFg != null
+        if (shouldRun && sessionConfirmed && contentAlive && immediateFg != null
                 && !immediateFg.equals(getPackageName())
                 && !immediateFg.equals(contentPkg)) {
             long now = System.currentTimeMillis();
@@ -171,7 +180,6 @@ public class KioskService extends Service {
         // force-stopped / not started yet), KioskService does NOT launch it — it brings the Lobby
         // forward and lets MainActivity.onResume() ask the server (headset_check_reconnect) whether
         // Content should be (re)started. Only a server connect command may launch Content.
-        boolean contentAlive = shouldRun && isAliveCached(contentPkg);
         boolean contentIsTarget = shouldRun && sessionConfirmed && contentAlive;
         String target = contentIsTarget ? contentPkg : getPackageName();
 
@@ -208,6 +216,20 @@ public class KioskService extends Service {
         lastHandledContentAlive = contentAlive;
         lastInterventionMs = now;
 
+        if (contentIsTarget && fg.equals(getPackageName())) {
+            // The LOBBY itself is in front (Content lost the foreground to it — e.g. the game was
+            // closed on the server and Content exited back to us). NEVER yank Content back over the
+            // Lobby: the Lobby is where game-end is detected — it reconnects and polls the server
+            // (headset_check_reconnect) and jumps back to Content only if the server still reports the
+            // game active. Yanking here would pin a session the server already closed, because the
+            // Lobby is not connected during a game and never received the disconnect, so should_run is
+            // stale-true. Let the Lobby stay and let the server decide. (Meta-menu overlays are a
+            // different foreground — handled by the immediate pullback above — so this only fires when
+            // the Lobby genuinely holds the front.)
+            Log.d(TAG, "Lobby is foreground during a should_run session — letting it re-check with the server");
+            lastLoggedFg = fg;
+            return;
+        }
         if (contentIsTarget) {
             // Content is a server-confirmed, alive session that lost the foreground → just raise it
             // back (single flash, no relaunch, no extras).
@@ -294,15 +316,13 @@ public class KioskService extends Service {
             return lastPidAlive;
         }
         lastPidCheckTime = now;
-        try {
-            java.lang.Process proc = Runtime.getRuntime().exec(new String[]{"sh", "-c", "pidof " + pkg});
-            proc.waitFor();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
-            String pid = reader.readLine();
-            lastPidAlive = pid != null && !pid.trim().isEmpty();
-        } catch (Exception e) {
-            lastPidAlive = false;
-        }
+        // NOT pidof: an untrusted app on Android 14 can't see another package's PID (Content always
+        // reads "dead" from here), which made the watchdog treat a live Content as dead, target the
+        // Lobby, and drag it in front of Content — stealing the shared clientId. UsageStats last-used
+        // IS visible: Content counts as alive while it's the more-recently-used app than the Lobby
+        // (true during play and under a Meta-menu overlay); an adb-kill / exit hands the foreground to
+        // the Lobby and flips this false, so the watchdog then correctly lets the Lobby take over.
+        lastPidAlive = MainActivity.contentUsedMoreRecentlyThanLobby(this, pkg);
         return lastPidAlive;
     }
 

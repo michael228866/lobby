@@ -93,6 +93,9 @@ public class MainActivity extends Activity {
     static final String PREF_CONTENT_SESSION_CONFIRMED = "content_session_confirmed";
     // Give up waiting for the server's connect reply after this long → clear stale state, stay in Lobby.
     private static final long CHECK_RECONNECT_TIMEOUT_MS = 8000;
+    // Idle-poll session verify: the server answers check_reconnect with connect in ~4-44ms when a
+    // game is active, so a short window is plenty — silence past this means the game is closed.
+    private static final long SESSION_VERIFY_TIMEOUT_MS = 1500;
     // While idle in the Lobby (connected, screen on, no Content), poll the server this often to ask
     // whether a game is now active for this headset — so a game started while we were asleep / after
     // a reboot / after our local state was cleared still gets picked up without asking on every
@@ -285,12 +288,12 @@ public class MainActivity extends Activity {
     /** Rebuild the URL from the current IPv4 and reconnect — unless Content owns the clientId. */
     private void reconnectAfterWake() {
         // Only the FOREGROUND Lobby may reconnect on wake. During a game the Lobby is paused
-        // (lobbyResumed=false); reconnecting then re-uses the shared clientId (device IPv4) and
-        // evicts Content on the server. lobbyResumed is the reliable gate — do NOT rely on
-        // contentOwnsClientId() alone here, because it falls back to pidof and Android 14 hides
-        // other apps' PIDs, so a live Content reads as dead and we'd wrongly reconnect. This was
-        // the one reconnect path missing this guard (the network/plain/scheduleReconnect paths
-        // all have it), which is why a sleep/wake during a game could steal Content's connection.
+        // (lobbyResumed=false) and Content is in front; reconnecting then re-uses the shared clientId
+        // (device IPv4) and evicts Content on the server. We do NOT reconnect and do NOT drag the Lobby
+        // forward — Content stays in front and reconnects its OWN socket (its Wi-Fi died for sleep). The
+        // watchdog keeps Content foregrounded via UsageStats (see KioskService), so the Lobby never
+        // needs to intervene here; if Content actually exited, the Lobby becomes foreground on its own
+        // and the normal onResume flow reconnects and re-checks with the server.
         if (!lobbyResumed) {
             Log.d(TAG, "SCREEN_ON but Lobby is backgrounded (game running); not reconnecting");
             return;
@@ -684,6 +687,18 @@ public class MainActivity extends Activity {
         String command = json.optString("command", "");
         Log.d(TAG, "headset_game_backend_command: " + command);
 
+        // Defensive: only act on a command addressed to THIS headset. The server targets a headset by
+        // headsetId (the device IPv4). If a command carrying a DIFFERENT headsetId reaches us (server
+        // broadcast / mis-route), ignore it — otherwise several headsets launch a game meant for one.
+        // A command with no headsetId is treated as addressed to us (server routed it to our socket).
+        String cmdHeadsetId = json.optString("headsetId", "");
+        String myHeadsetId = getClientId();
+        if (!cmdHeadsetId.isEmpty() && !cmdHeadsetId.equals(myHeadsetId)) {
+            Log.w(TAG, "Ignoring '" + command + "' addressed to a different headset: headsetId="
+                    + cmdHeadsetId + " (mine=" + myHeadsetId + ")");
+            return;
+        }
+
         if ("connect".equals(command)) {
             JSONObject connectData = json.optJSONObject("connectData");
             if (connectData == null) {
@@ -1019,8 +1034,16 @@ public class MainActivity extends Activity {
      * Periodic idle poll: while the Lobby is connected, awake, and Content is NOT running, ask the
      * server every CHECK_RECONNECT_POLL_MS whether a game is now active. Server replies connect → we
      * jump; silent → we stay and poll again. Self-reschedules forever and self-gates, so it does
-     * nothing (but keep ticking) during a game or during sleep. Uses the bare query (no
-     * timeout/clear) — polling must never clear the pendingCheckReconnect session state.
+     * nothing (but keep ticking) during a game or during sleep.
+     *
+     * <p>If a Content session is still marked active ({@code content_should_run==true}) while the
+     * Lobby is the foreground app, that session was almost certainly closed by the server — the
+     * server closes a game by telling Content (HellVR) only, never the Lobby, so should_run stays
+     * stale-true and the watchdog would resurrect the dead Content on the next wake. Since the Lobby
+     * is genuinely in front here (Content is gone → no live connection to evict), we verify with the
+     * clearing timeout: no connect within CHECK_RECONNECT_TIMEOUT_MS → clear the stale session now,
+     * while still awake, so a later sleep/wake has nothing to resurrect. The timeout is armed once
+     * (guarded by pendingCheckReconnect) so repeated 5s polls don't keep resetting it.
      */
     private final Runnable checkReconnectPollRunnable = new Runnable() {
         @Override
@@ -1029,7 +1052,19 @@ public class MainActivity extends Activity {
             // front and owns the clientId) and not inside Content's launch grace window.
             if (lobbyResumed && !contentOwnsClientId()) {
                 if (webSocket != null && socketState == SocketState.CONNECTED) {
-                    sendCheckReconnectMessage();
+                    boolean staleSession = getSharedPreferences(PREFS, MODE_PRIVATE)
+                            .getBoolean(PREF_CONTENT_SHOULD_RUN, false);
+                    if (staleSession && !pendingCheckReconnect) {
+                        Log.d(TAG, "Idle poll: Lobby foreground but content_should_run still true — "
+                                + "verifying with server (clear if no connect)");
+                        pendingCheckReconnect = true;
+                        sendCheckReconnectMessage();
+                        mainHandler.removeCallbacks(checkReconnectTimeoutRunnable);
+                        mainHandler.postDelayed(checkReconnectTimeoutRunnable, SESSION_VERIFY_TIMEOUT_MS);
+                    } else if (!staleSession) {
+                        sendCheckReconnectMessage();   // normal idle discovery (no clear)
+                    }
+                    // staleSession && pendingCheckReconnect → verification already in flight; wait.
                 } else if (webSocket == null) {
                     // Connection watchdog: we're a foreground Lobby with no socket — make sure a
                     // reconnect is queued (covers a drop that no callback re-armed).
@@ -1140,8 +1175,12 @@ public class MainActivity extends Activity {
         // and evict the Content that is still coming up (Content then fails to connect / crashes).
         long launchedAt = prefs.getLong(PREF_CONTENT_LAUNCHED_AT, 0);
         if (System.currentTimeMillis() - launchedAt < KIOSK_LAUNCH_GRACE_MS) return true;
-        // After the startup window, only if the process is actually alive.
-        return isContentProcessAlive(currentContentPackage);
+        // After the startup window: is Content still the active app? pidof can't tell (Android 14
+        // hides other apps' PIDs — it always reads dead from here), so use UsageStats last-used. This
+        // keeps the Lobby from reconnecting on the shared clientId while Content is alive; when Content
+        // exits / is adb-killed the Lobby becomes the newer app and this flips false so the Lobby can
+        // reconnect and take over.
+        return contentUsedMoreRecentlyThanLobby(this, currentContentPackage);
     }
 
     /**
@@ -1227,6 +1266,39 @@ public class MainActivity extends Activity {
             }
         }
         return latestPackage == null ? null : new Foreground(latestPackage, latestTime);
+    }
+
+    /**
+     * True when Content looks like the active app, judged by UsageStats "last time used" instead of
+     * pidof. An untrusted app on Android 14 CANNOT see another package's PID (pidof / ps both return
+     * nothing, so Content always reads "dead" from inside this app) — but usage-stats last-used IS
+     * visible and is how the watchdog already detects the foreground. Content is the owner when it
+     * was used more recently than the Lobby: while Content plays (or a Meta-menu panel overlays it)
+     * Content stays the newer of the two; only Content actually exiting / being adb-killed hands the
+     * foreground to the Lobby and flips this false — which is exactly when the Lobby SHOULD take over.
+     * Shared (static) so KioskService uses the identical signal. Returns false if usage access is off.
+     */
+    public static boolean contentUsedMoreRecentlyThanLobby(Context ctx, String contentPkg) {
+        if (contentPkg == null || contentPkg.isEmpty()) return false;
+        AppOpsManager appOps = (AppOpsManager) ctx.getSystemService(Context.APP_OPS_SERVICE);
+        int mode = appOps.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), ctx.getPackageName());
+        if (mode != AppOpsManager.MODE_ALLOWED) return false;
+        UsageStatsManager usm = (UsageStatsManager) ctx.getSystemService(Context.USAGE_STATS_SERVICE);
+        long end = System.currentTimeMillis();
+        // 12h window comfortably spans any single game session; last-used timestamps persist within it.
+        long begin = end - 1000L * 60 * 60 * 12;
+        java.util.List<android.app.usage.UsageStats> stats =
+                usm.queryUsageStats(UsageStatsManager.INTERVAL_BEST, begin, end);
+        if (stats == null) return false;
+        String lobbyPkg = ctx.getPackageName();
+        long tContent = 0, tLobby = 0;
+        for (android.app.usage.UsageStats s : stats) {
+            String p = s.getPackageName();
+            if (contentPkg.equals(p)) tContent = Math.max(tContent, s.getLastTimeUsed());
+            else if (lobbyPkg.equals(p)) tLobby = Math.max(tLobby, s.getLastTimeUsed());
+        }
+        return tContent > 0 && tContent >= tLobby;
     }
 
     /**
